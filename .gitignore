@@ -2,4 +2,35 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_ed25519*
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.pid
+*.zip
+/data/*
+!/data/layouts/
+!/data/examples/
+!/data/local-check/
+/data/local-check/*
+!/data/local-check/.gitkeep
+
+# Local experiments and temporary test data remain outside source delivery.
+/research/
+/tests/tmp*/
+
+# Local Neo4j runtime and generated graph datasets are not source delivery.
+.runtime/
+*.jar
 data/checkpoints/*.json
+data/generated/
+lys-warehouse-design-20261027/

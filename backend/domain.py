@@ -41,7 +41,7 @@ ROBOT_TYPES: dict[str, dict[str, Any]] = {
     },
 }
 
-MOVING_STAGES = {"toPick", "toRack", "returning"}
+MOVING_STAGES = {"toQueue", "toPick", "toRack", "returning"}
 
 
 def robot_type_key(robot_id: int) -> str:
@@ -95,6 +95,7 @@ class RobotState:
     depth_row: int = 0
     task_id: str | None = None
     cargo_id: str | None = None
+    task_type: str = "INBOUND"
     priority: str = "normal"
     alert: str = ""
     path: list[dict[str, float]] = field(default_factory=list)
@@ -104,6 +105,11 @@ class RobotState:
     phase: float = 0.0
     blocked_steps: int = 0
     revision: int = 0
+    route_planned: bool = False
+    pickup_x: float | None = None
+    pickup_y: float | None = None
+    queue_x: float | None = None
+    queue_y: float | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "RobotState":
@@ -111,7 +117,10 @@ class RobotState:
         return cls(**{key: deepcopy(value) for key, value in payload.items() if key in fields})
 
 
-def pickup_point(robot_id: int) -> dict[str, float]:
+def pickup_point(robot_id: int, layout: str = 'edge') -> dict[str, float]:
+    if layout == 'corner':
+        station = (robot_id-1)%8
+        return {'x':1.4+(station%4)*1.05,'y':19.3+(station//4)*1.05}
     # Five shallow rows of twenty stations keep initial robot positions unique.
     column = (robot_id - 1) % 20
     row = (robot_id - 1) // 20
@@ -122,6 +131,11 @@ def outbound_point(robot_id: int) -> dict[str, float]:
     column = (robot_id - 1) % 20
     row = (robot_id - 1) // 20
     return {"x": 1.55 + column * 1.48, "y": 0.9 + row * 0.46}
+
+
+def inbound_queue_point(robot_id: int) -> dict[str,float]:
+    index=robot_id-1
+    return {'x':.9+(index%10)*.5,'y':13.0+(index//10)*.5}
 
 
 def compact_path(path: list[dict[str, float]]) -> list[dict[str, float]]:
@@ -220,7 +234,12 @@ class RobotAgent:
         state.task_round += 1
         state.task_id = assignment["task_id"]
         state.cargo_id = assignment["cargo_id"]
+        state.task_type = assignment.get("task_type", "INBOUND")
         state.priority = assignment.get("priority", "normal")
+        station = assignment.get('pickup') or pickup_point(state.robot_id)
+        state.pickup_x,state.pickup_y = station['x'],station['y']
+        queue=assignment.get('queue')
+        state.queue_x,state.queue_y = (queue['x'],queue['y']) if queue else (None,None)
         state.rack_id = int(assignment["rack_id"])
         state.slot_id = assignment["slot_id"]
         state.zone = assignment["zone"]
@@ -233,7 +252,7 @@ class RobotAgent:
         state.depth_row = int(assignment["depth_row"])
         state.alert = ""
         state.blocked_steps = 0
-        self._set_moving_stage("toPick")
+        self._set_moving_stage('toQueue' if queue else "toPick")
         state.revision += 1
         return {"accepted": True, "robot": self.snapshot()}
 
@@ -253,9 +272,33 @@ class RobotAgent:
             "from": start,
             "to": {"x": end_state["x"], "y": end_state["y"]},
             "priority": self.state.priority,
+            "blocked_steps": self.state.blocked_steps,
             "proposed": proposed,
             "events": events,
         }
+
+    def reroute(self, path: list[dict[str, float]]) -> dict[str, Any]:
+        if self.state.stage not in MOVING_STAGES or len(path) < 2:
+            return self.snapshot()
+        if math.hypot(path[0]["x"]-self.state.x,path[0]["y"]-self.state.y) > 1e-7:
+            raise ValueError("reroute must begin at the committed position")
+        destination = self.state.path[-1]
+        if math.hypot(path[-1]["x"]-destination["x"],path[-1]["y"]-destination["y"]) > 1e-7:
+            raise ValueError("reroute cannot change the task destination")
+        self.state.path = deepcopy(path)
+        self.state.path_index = 1
+        self.state.stage_distance = max(.001, route_length(path))
+        self.state.distance_travelled = 0.
+        self.state.route_planned = True
+        self.state.revision += 1
+        return self.snapshot()
+
+    def admit_pickup(self):
+        if self.state.stage != 'queued':
+            raise ValueError('pickup admission requires a queued robot')
+        self._set_moving_stage('toPick')
+        self.state.revision += 1
+        return self.snapshot()
 
     def commit_step(self, proposal: dict[str, Any], accepted: bool) -> dict[str, Any]:
         if proposal["base_revision"] != self.state.revision:
@@ -295,16 +338,21 @@ class RobotAgent:
             arrived = self._move_along_path(delta_seconds * state.speed)
             state.battery = max(4.0, state.battery - delta_seconds * 0.0035)
             if arrived:
-                if state.stage == "toPick":
+                if state.stage == 'toQueue':
+                    state.stage='queued'
+                    events.append(self._event(tick_id,'inbound_queued','抵达入库等候位，等待工位准入'))
+                elif state.stage == "toPick":
                     state.stage = "picking"
                     state.action_duration = 2.1 + self.rng.random()
                     state.action_timer = 0.0
-                    events.append(self._event(tick_id, "pickup_started", "抵达入库台，开始识别货物"))
+                    text = "抵达入库台，开始识别货物" if state.task_type == "INBOUND" else "抵达货位，开始拣取货物"
+                    events.append(self._event(tick_id, "pickup_started", text))
                 elif state.stage == "toRack":
                     state.stage = "placing"
                     state.action_duration = 4.4
                     state.action_timer = 0.0
-                    events.append(self._event(tick_id, "placement_started", "抵达目标货架，开始伸臂上架"))
+                    text = "抵达目标货架，开始伸臂上架" if state.task_type == "INBOUND" else "抵达出库台，开始交接货物"
+                    events.append(self._event(tick_id, "placement_started", text))
                 else:
                     state.stage = "charging" if state.battery < 28.0 else "idle"
                     state.idle_timer = 0.0 if state.stage == "charging" else 1.5 + self.rng.random() * 5.0
@@ -326,7 +374,11 @@ class RobotAgent:
                         self._event(
                             tick_id,
                             "task_completed",
-                            f"已完成 {state.zone}-{state.rack_id:02d} / C{state.bay} / L{state.level} 上架",
+                            (
+                                f"已完成 {state.zone}-{state.rack_id:02d} / C{state.bay} / L{state.level} 上架"
+                                if state.task_type == "INBOUND"
+                                else f"已完成货物 {state.cargo_id} 出库交接"
+                            ),
                         )
                     )
                     self._set_moving_stage("returning")
@@ -347,18 +399,25 @@ class RobotAgent:
                 state.alert = ""
             return events
 
+        if state.stage == 'queued':
+            return events
+
         state.idle_timer = max(0.0, state.idle_timer - delta_seconds)
         return events
 
     def _set_moving_stage(self, stage_name: str) -> None:
         state = self.state
         state.stage = stage_name
-        if stage_name == "toPick":
-            destination = pickup_point(state.robot_id)
+        state.route_planned = False
+        if stage_name == 'toQueue':
+            destination={'x':state.queue_x,'y':state.queue_y}
+            kind='pickup'
+        elif stage_name == "toPick":
+            destination = ({'x':state.pickup_x,'y':state.pickup_y} if state.pickup_x is not None else pickup_point(state.robot_id))
             kind = "pickup"
         elif stage_name == "toRack":
             destination = {"x": state.target_x, "y": state.target_y}
-            kind = "rack"
+            kind = "rack" if state.task_type == "INBOUND" else "outbound"
         else:
             destination = outbound_point(state.robot_id)
             kind = "outbound"
@@ -387,6 +446,9 @@ class RobotAgent:
             amount -= step
             if step >= distance - 0.001:
                 state.path_index += 1
+                # One straight segment per commit: the traffic arbiter's swept
+                # segment must describe the actual movement, including corners.
+                break
         return state.path_index >= len(state.path)
 
     def _event(self, tick_id: int, event_type: str, text: str) -> dict[str, Any]:

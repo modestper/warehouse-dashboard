@@ -7,18 +7,87 @@
       "label": "快速闭环：19任务与低电接力",
       "scene": "data/layouts/warehouse100-wide-v2.json",
       "dataset": "data/examples/warehouse-v5",
+      "mobility": "legacy",
+      "locations_csv": "docs/dataset-contract/layout/task-locations.csv",
+      "graph_dataset_id": "dataset:warehouse-live:sample19",
       "disturbances_json": "config/live-sample-disturbances.json"
     },
     "peak1728": {
       "label": "高峰：1728任务 / 100机器人",
       "scene": "data/layouts/warehouse100-wide-v2.json",
       "dataset": "data/examples/regression/peak",
-      "config": {"charging_policy": "critical-only"}
+      "mobility": "legacy",
+      "locations_csv": "docs/dataset-contract/layout/task-locations.csv",
+      "graph_dataset_id": "dataset:warehouse-live:peak1728",
+      "config_json": "data/examples/regression/peak/config.json",
+      "disturbances_json": "data/examples/regression/peak/disturbances.json"
+    },
+    "day": {
+      "label": "全天均匀：6912任务 / 24小时",
+      "scene": "data/layouts/warehouse100-wide-v2.json",
+      "dataset": "data/examples/regression/day",
+      "mobility": "legacy",
+      "locations_csv": "docs/dataset-contract/layout/task-locations.csv",
+      "graph_dataset_id": "dataset:warehouse-live:day",
+      "config_json": "data/examples/regression/day/config.json",
+      "disturbances_json": "data/examples/regression/day/disturbances.json"
+    },
+    "peak-2h": {
+      "label": "两小时高峰：768任务",
+      "scene": "data/layouts/warehouse100-wide-v2.json",
+      "dataset": "data/examples/regression/peak-2h",
+      "mobility": "legacy",
+      "locations_csv": "docs/dataset-contract/layout/task-locations.csv",
+      "graph_dataset_id": "dataset:warehouse-live:peak-2h",
+      "config_json": "data/examples/regression/peak-2h/config.json",
+      "disturbances_json": "data/examples/regression/peak-2h/disturbances.json"
+    },
+    "hotspot-2h": {
+      "label": "两小时局部热点：924任务",
+      "scene": "data/layouts/warehouse100-wide-v2.json",
+      "dataset": "data/examples/regression/hotspot-2h",
+      "mobility": "legacy",
+      "locations_csv": "docs/dataset-contract/layout/task-locations.csv",
+      "graph_dataset_id": "dataset:warehouse-live:hotspot-2h",
+      "config_json": "data/examples/regression/hotspot-2h/config.json",
+      "disturbances_json": "data/examples/regression/hotspot-2h/disturbances.json"
+    },
+    "continuous-2d": {
+      "label": "两天低强度连续流：1034任务",
+      "scene": "data/layouts/warehouse100-wide-v2.json",
+      "dataset": "data/examples/regression/continuous-2d",
+      "mobility": "legacy",
+      "locations_csv": "docs/dataset-contract/layout/task-locations.csv",
+      "graph_dataset_id": "dataset:warehouse-live:continuous-2d",
+      "config_json": "data/examples/regression/continuous-2d/config.json",
+      "disturbances_json": "data/examples/regression/continuous-2d/disturbances.json"
     },
     "seven-patterns": {
       "label": "七天典型波动：50112任务",
       "scene": "data/layouts/warehouse100-wide-v2.json",
-      "dataset": "data/datasets/live-seven-patterns"
+      "dataset": "data/examples/seven-patterns-20261028",
+      "mobility": "legacy",
+      "locations_csv": "docs/dataset-contract/layout/task-locations.csv",
+      "graph_dataset_id": "dataset:warehouse-live:seven-patterns"
+    },
+    "medium1728": {
+      "label": "轮式中型仓库：48架 / 1728高峰任务 / 自由口",
+      "scene": "data/layouts/expansion-candidates/medium/layout.json",
+      "dataset": "data/examples/wheeled-medium-peak",
+      "mobility": "wheeled",
+      "locations_csv": "data/layouts/expansion-candidates/medium/task-locations.csv",
+      "graph_dataset_id": "dataset:warehouse-logical-boundaries-v1:2026-10-27",
+      "config_json": "config/wheeled-medium-100.json"
+    },
+    "medium19": {
+      "label": "轮式中型仓库：19任务与低电接力",
+      "scene": "data/layouts/expansion-candidates/medium/layout.json",
+      "dataset": "data/examples/wheeled-medium-sample19",
+      "mobility": "wheeled",
+      "locations_csv": "data/layouts/expansion-candidates/medium/task-locations.csv",
+      "graph_dataset_id": "dataset:warehouse-live:medium19",
+      "config_json": "config/wheeled-medium-100.json",
+      "disturbances_json": "config/live-sample-disturbances.json"
     }
   }
 }

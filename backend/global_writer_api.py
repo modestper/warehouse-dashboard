@@ -346,10 +346,8 @@ def main(argv=None):
     parser.add_argument('--port', type=int, default=14284)
     parser.add_argument('--queue-size', type=int, default=256)
     args = parser.parse_args(argv)
-    writer = GlobalWriter(uri=os.environ.get('WAREHOUSE_NEO4J_URI', 'bolt://127.0.0.1:47687'),
-                          user=os.environ.get('WAREHOUSE_NEO4J_USER', 'neo4j'),
-                          password=os.environ.get('WAREHOUSE_NEO4J_PASSWORD'),
-                          database=os.environ.get('WAREHOUSE_NEO4J_DATABASE', 'neo4j'))
+    from ops.warehouse_kg_config import Neo4jConnection
+    writer = GlobalWriter(**Neo4jConnection.from_env().writer_config())
     import uvicorn
     if not 16 <= args.queue_size <= 10000:
         parser.error('--queue-size must be within 16..10000')

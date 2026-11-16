@@ -1,5 +1,5 @@
 /* Real V5 -> existing dashboard view model. Never generates tasks or motion. */
-import {normalizeFrame, robotCategory, attentionReason, stageLabel, formatClock} from './live-model.mjs';
+import {normalizeFrame, robotCategory, attentionReason, stageLabel, formatClock, newRunOptions} from './live-model.mjs';
 import {platformMotionEvidence} from './motion-view.mjs';
 export {platformMotionOrigin,platformRenderPosition,platformRoutePoints} from './motion-view.mjs';
 const viewStates=new WeakMap();
@@ -70,9 +70,9 @@ export function adaptPlatformFrame(value, scene, previous=null, trails=new Map()
       text:[e.kind,e.task_id,e.goods_id,e.location_id].filter(Boolean).join(' · ')}))};
 }
 
-export function platformControl(action,value,frame,datasetId) {
+export function platformControl(action,value,frame,datasetId,newRunId='',maxTicks='') {
   if(!frame?.runId)throw new Error('等待真实运行身份');
   const mapped=({set_speed:'speed',reset:'new_run'})[action]||action;
   if(!['start','resume','pause','step','speed','checkpoint','new_run'].includes(mapped))throw new Error('固定数据集不接受随机任务或流量修改');
-  return {action:mapped,expected_run_id:frame.runId,...(mapped==='new_run'?{dataset_id:datasetId}:value===null?{}:{value})};
+  return {action:mapped,expected_run_id:frame.runId,...(mapped==='new_run'?newRunOptions(datasetId,newRunId,maxTicks):value===null?{}:{value})};
 }

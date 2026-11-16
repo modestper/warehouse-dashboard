@@ -68,35 +68,34 @@ def robot_graph_snapshots(sim, fresh, backend):
     return snapshots
 
 
-def bootstrap_robot_graph(sim, state_interval):
+def bootstrap_robot_graph(sim, state_interval, *, record_agent_state=True, write_router=None, context_queries=False):
     """Create schema and the shared Run once; return the per-actor writer config."""
     from ..warehouse_runtime_graph import Neo4jRuntimeGraphWriter
-    uri = os.environ.get('WAREHOUSE_NEO4J_URI') or os.environ.get('NEO4J_URI') or 'bolt://127.0.0.1:47687'
-    user = os.environ.get('WAREHOUSE_NEO4J_USER') or os.environ.get('NEO4J_USER') or 'neo4j'
-    password = os.environ.get('WAREHOUSE_NEO4J_PASSWORD') or os.environ.get('NEO4J_PASSWORD')
-    database = os.environ.get('WAREHOUSE_NEO4J_DATABASE') or os.environ.get('NEO4J_DATABASE') or 'neo4j'
+    from ops.warehouse_kg_config import Neo4jConnection
+    connection = Neo4jConnection.from_env().writer_config()
     dataset_id = os.environ.get('WAREHOUSE_NEO4J_DATASET_ID') or None
-    if not password:
+    if not connection['password']:
         raise ValueError('--robot-graph requires WAREHOUSE_NEO4J_PASSWORD')
-    bootstrap = Neo4jRuntimeGraphWriter(
-        uri=uri, user=user, password=password, database=database,
-        dataset_id=dataset_id, state_interval_ticks=state_interval)
-    try:
-        bootstrap.ensure_schema()
-        bootstrap.ensure_run({
+    config = {**connection, 'dataset_id': dataset_id, 'state_interval_ticks': state_interval,
+              'record_agent_state': record_agent_state}
+    run = {
             'id': str(sim.run_id),
             'backend': 'warehouse-real-scale-v1-ray',
             'started_at_ms': int(time.time() * 1000),
             'robot_count': len(sim.robots),
             'max_active_robots': int(sim.config.max_active_robots),
             'dataset_id': dataset_id,
-        })
-    finally:
-        bootstrap.close()
-    return {
-        'uri': uri, 'user': user, 'password': password, 'database': database,
-        'dataset_id': dataset_id, 'state_interval_ticks': state_interval,
-    }
+        }
+    if write_router is not None:
+        write_router.bootstrap(config, run, context_queries)
+    else:
+        bootstrap = Neo4jRuntimeGraphWriter(**config)
+        try:
+            bootstrap.ensure_schema()
+            bootstrap.ensure_run(run)
+        finally:
+            bootstrap.close()
+    return config
 
 
 class RayWideMixin:

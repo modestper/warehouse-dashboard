@@ -1,0 +1,67 @@
+{
+  "rows": 823,
+  "all_frame_ids_unique": true,
+  "peaks": {
+    "delivering": {
+      "recomputed": 99,
+      "time": "10:33:00"
+    },
+    "business_positive_battery": {
+      "recomputed": 90,
+      "time": "10:23:20"
+    },
+    "dispatch_business_positive_battery": {
+      "recomputed": 91,
+      "time": "10:24:20"
+    },
+    "moving": {
+      "recomputed": 92,
+      "time": "10:25:00"
+    },
+    "carrying": {
+      "recomputed": 41,
+      "time": "10:29:00"
+    }
+  },
+  "terminal_statuses": {
+    "delivering": 97,
+    "returning": 3
+  },
+  "terminal_returning": [
+    {
+      "id": "drone-16",
+      "queue_len": 0,
+      "battery": 0,
+      "target": {
+        "task_id": null,
+        "phase": "charge",
+        "x": 13524559.632,
+        "y": 3615225.069
+      }
+    },
+    {
+      "id": "drone-39",
+      "queue_len": 0,
+      "battery": 0,
+      "target": {
+        "task_id": null,
+        "phase": "charge",
+        "x": 13501109.911,
+        "y": 3654987.13
+      }
+    },
+    {
+      "id": "drone-69",
+      "queue_len": 0,
+      "battery": 0,
+      "target": {
+        "task_id": null,
+        "phase": "charge",
+        "x": 13536060.524,
+        "y": 3674476.951
+      }
+    }
+  ],
+  "lade_sources_unchanged": true,
+  "analysis_script_sha256": "254aa0146255dac6a7fc2f36fb587da9ede289418c9b882674f9e7ef863bc431"
+}

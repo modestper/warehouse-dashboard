@@ -1,0 +1,6 @@
+{
+  "status": "interrupted_exploratory_run",
+  "reason": "Stopped the owned analysis process after observing persistent zero motion; reran with additional dispatch-boundary observations and an explicit energy-exhaustion proof check.",
+  "authoritative_result_directory": "../04-lade-shanghai-0621-concurrency-20s-verified",
+  "whole_day_completed": false
+}

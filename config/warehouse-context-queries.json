@@ -1,0 +1,131 @@
+{
+  "catalog_version": "warehouse-operation-context-v3",
+  "queries": [
+    {
+      "id": "w0",
+      "name": "basis",
+      "category": "self",
+      "description": "我在什么运行、什么完成步上决策？自己的观测是否可用？",
+      "temporal_scope": "as_of",
+      "cypher": "MATCH (run:Run {id: $run_id})\nWITH run, coalesce($at_tick, run.latest_step) AS t\nOPTIONAL MATCH (step:Step {run_id: $run_id, tick: t})\nWITH run, t, collect(step) AS steps\nCALL {\n  WITH run\n  OPTIONAL MATCH (run)-[:USES_DATASET]->(dataset:Dataset)\n  RETURN collect(DISTINCT dataset{.id, .start, .time_unit, .warehouse_id}) AS datasets\n}\nCALL {\n  WITH run, t\n  OPTIONAL MATCH (robot:Robot {id: $run_id + ':robot:' + toString($robot_id), run_id: $run_id})\n  OPTIONAL MATCH (exact:AgentState {id:robot.id+':state:'+toString(t),\n                                    run_id:$run_id, robot_node_id:robot.id, tick:t})\n  CALL {\n    WITH robot, exact, t\n    WITH robot, t WHERE exact IS NULL\n    OPTIONAL MATCH (previous:AgentState {run_id:$run_id, robot_node_id:robot.id})\n    WHERE previous.tick <= t\n    WITH previous ORDER BY previous.tick DESC, previous.id DESC LIMIT 1\n    RETURN head(collect(previous)) AS fallback\n  }\n  WITH robot, coalesce(exact, fallback) AS state\n  RETURN robot.type AS robot_type,\n         state{.tick, .stage, .battery, .x, .y, .task_id, .cargo_id} AS self_state\n}\nRETURN run.id AS run_id, t, run.latest_step AS published_tick,\n       size(steps) AS step_count,\n       CASE WHEN size(steps) = 1 THEN properties(steps[0]) ELSE null END AS step,\n       datasets, run.dataset_id AS declared_dataset_id, robot_type, self_state,\n       t - self_state.tick AS state_age_ticks,\n       run.config_json AS config_json,\n       run.scene_sha256 AS scene_sha256, run.tasks_sha256 AS tasks_sha256,\n       CASE WHEN size(steps) = 1 AND steps[0].complete = true\n                 AND steps[0].received_robot_count >= steps[0].expected_robot_count\n                 AND steps[0].expected_robot_count > 0\n                 AND t <= run.latest_step\n                 AND robot_type IS NOT NULL\n                 AND self_state IS NOT NULL AND t - self_state.tick <= $max_state_age_ticks\n            THEN true ELSE false END AS observation_ready",
+      "requires_tasks": false
+    },
+    {
+      "id": "w1",
+      "name": "task_pool",
+      "category": "task",
+      "description": "我空闲时，有哪些已释放的任务值得进一步评估？",
+      "temporal_scope": "as_of",
+      "cypher": "MATCH (:Run {id: $run_id})\nOPTIONAL MATCH (snapshot:DispatchState {run_id: $run_id})\nWHERE snapshot.tick <= $t\nWITH snapshot ORDER BY snapshot.tick DESC, snapshot.commit_seq DESC LIMIT 1\nRETURN snapshot IS NOT NULL AS has_snapshot,\n       snapshot.tick AS observed_tick, $t - snapshot.tick AS age_ticks,\n       CASE WHEN snapshot IS NOT NULL AND $t - snapshot.tick <= $max_snapshot_age_ticks\n            THEN true ELSE false END AS snapshot_fresh,\n       snapshot.elapsed AS snapshot_elapsed,\n       snapshot.pending_json AS pending_json,\n       snapshot.active_jobs_json AS active_jobs_json,\n       snapshot.tasks_json AS tasks_json,\n       snapshot.ports_json AS ports_json,\n       'bounded_queue_total_unknown' AS completeness",
+      "requires_tasks": false
+    },
+    {
+      "id": "w2",
+      "name": "task_geometry",
+      "category": "task",
+      "description": "这个任务到哪里取、到哪里放？我的机械臂能完成剩余操作吗？",
+      "temporal_scope": "as_of",
+      "cypher": "MATCH (:Run {id:$run_id})\nUNWIND $task_ids AS requested_task_id\nCALL {\n  WITH requested_task_id\n  OPTIONAL MATCH (:Execution {run_id:$run_id, task_id:requested_task_id})\n                 -[:EXECUTES]->(linked:WarehouseTask {task_id:requested_task_id})\n  WITH requested_task_id, collect(DISTINCT linked) AS linked_tasks\n  OPTIONAL MATCH (scoped:WarehouseTask {dataset_id:$dataset_id, task_id:requested_task_id})\n  WITH linked_tasks, collect(DISTINCT scoped) AS scoped_tasks\n  RETURN CASE WHEN size(linked_tasks) = 1 THEN linked_tasks[0]\n              WHEN size(linked_tasks) = 0 AND size(scoped_tasks) = 1 THEN scoped_tasks[0]\n              ELSE null END AS task,\n         CASE WHEN size(linked_tasks) = 1 THEN 'run_execution_link'\n              WHEN size(linked_tasks) > 1 THEN 'ambiguous_execution_links'\n              WHEN size(scoped_tasks) = 1 THEN 'run_dataset_namespace'\n              WHEN size(scoped_tasks) > 1 THEN 'ambiguous_static_definitions'\n              ELSE 'not_observed' END AS task_resolution\n}\nOPTIONAL MATCH (task)-[:CONCERNS]->(goods:Goods)\nOPTIONAL MATCH (task)-[:FROM]->(source:Location)\nOPTIONAL MATCH (task)-[:TO]->(target:Location)\nCALL {\n  WITH task, source, target\n  OPTIONAL MATCH (dataset:Dataset {id:task.dataset_id})\n  OPTIONAL MATCH (dataset)-[:USES_LAYOUT]->(layout:Warehouse)\n  WITH source, target, dataset, collect(DISTINCT layout) AS layouts\n  OPTIONAL MATCH (direct:Warehouse)\n  WHERE direct.id = source.warehouse_id OR direct.id = target.warehouse_id\n  WITH dataset, layouts, collect(DISTINCT direct) AS direct_layouts\n  RETURN dataset.start AS dataset_start,\n    CASE WHEN size(direct_layouts) = 1 THEN direct_layouts[0]\n         WHEN size(direct_layouts) = 0 AND size(layouts) = 1 THEN layouts[0]\n         ELSE null END AS warehouse\n}\nCALL {\n  WITH warehouse\n  OPTIONAL MATCH (warehouse)-[:HAS_LOCATION]->(port:Location)\n  WHERE port.kind IN ['inbound', 'outbound']\n  RETURN collect(port{.location_id, .kind, .x, .y}) AS physical_ports\n}\nOPTIONAL MATCH (warehouse)-[:HAS_RACK]->(source_rack:Rack)-[:HAS_SLOT]->(source)\nOPTIONAL MATCH (warehouse)-[:HAS_RACK]->(target_rack:Rack)-[:HAS_SLOT]->(target)\nCALL {\n  WITH requested_task_id\n  OPTIONAL MATCH (event:RuntimeEvent {run_id:$run_id, task_id:requested_task_id, type:'boundary_port_bound'})\n  WHERE event.tick <= $t\n  WITH event ORDER BY event.tick DESC, event.id DESC LIMIT $binding_fetch_limit\n  RETURN collect(properties(event)) AS boundary_bindings\n}\nRETURN requested_task_id, task IS NOT NULL AS task_exists, task_resolution,\n       properties(task) AS task, goods.goods_id AS goods_id,\n       dataset_start, properties(warehouse) AS warehouse_spec,\n       properties(source) AS source, properties(target) AS target,\n       properties(source_rack) AS source_rack, properties(target_rack) AS target_rack,\n       physical_ports, boundary_bindings",
+      "requires_tasks": true
+    },
+    {
+      "id": "w3",
+      "name": "task_evidence",
+      "category": "execution",
+      "description": "任务有没有被执行、重新排队或交接？目前有哪些归属和载货证据？",
+      "temporal_scope": "as_of",
+      "cypher": "MATCH (:Run {id:$run_id})\nUNWIND $task_ids AS requested_task_id\nCALL {\n  WITH requested_task_id\n  OPTIONAL MATCH (state:ExecutionState {run_id: $run_id, task_id: requested_task_id})\n  WHERE state.tick <= $t\n  WITH state ORDER BY state.tick DESC, state.id DESC LIMIT 1\n  RETURN properties(state) AS execution_sample\n}\nCALL {\n  WITH requested_task_id\n  OPTIONAL MATCH (change:OwnershipChange {run_id: $run_id, task_id: requested_task_id})\n  WHERE change.tick <= $t\n  WITH change ORDER BY change.tick DESC, change.id DESC LIMIT $evidence_fetch_limit\n  RETURN collect(properties(change)) AS ownership_changes\n}\nCALL {\n  WITH requested_task_id\n  OPTIONAL MATCH (handoff:Handoff {run_id: $run_id, task_id: requested_task_id})\n  WHERE handoff.tick <= $t\n  WITH handoff ORDER BY handoff.tick DESC, handoff.id DESC LIMIT $evidence_fetch_limit\n  RETURN collect(properties(handoff)) AS handoffs\n}\nCALL {\n  WITH requested_task_id\n  OPTIONAL MATCH (event:RuntimeEvent {run_id: $run_id, task_id: requested_task_id})\n  WHERE event.tick <= $t AND event.type <> 'boundary_port_bound'\n  WITH event ORDER BY event.tick DESC, event.id DESC LIMIT $evidence_fetch_limit\n  RETURN collect(properties(event)) AS operation_events\n}\nRETURN requested_task_id, (execution_sample IS NOT NULL OR size(ownership_changes) > 0\n        OR size(handoffs) > 0 OR size(operation_events) > 0) AS task_observed,\n       execution_sample, ownership_changes, handoffs, operation_events",
+      "requires_tasks": true
+    },
+    {
+      "id": "w4",
+      "name": "peer_states",
+      "category": "coordination",
+      "description": "哪些同伴值得进一步联系或避让？谁可能接走已取下的货？",
+      "temporal_scope": "as_of",
+      "cypher": "MATCH (:Run {id: $run_id})\nMATCH (robot:Robot {run_id: $run_id})\nWHERE robot.robot_id <> $robot_id\nCALL {\n  WITH robot\n  OPTIONAL MATCH (exact:AgentState {id:robot.id+':state:'+toString($t),\n                                    run_id:$run_id, robot_node_id:robot.id, tick:$t})\n  CALL {\n    WITH robot, exact\n    WITH robot WHERE exact IS NULL\n    OPTIONAL MATCH (previous:AgentState {run_id:$run_id, robot_node_id:robot.id})\n    WHERE previous.tick <= $t\n    WITH previous ORDER BY previous.tick DESC, previous.id DESC LIMIT 1\n    RETURN head(collect(previous)) AS fallback\n  }\n  WITH coalesce(exact, fallback) AS state\n  RETURN state{.tick, .stage, .battery, .x, .y, .task_id, .cargo_id} AS state\n}\nRETURN robot.robot_id AS robot_id, robot.type AS robot_type, state,\n       $t - state.tick AS age_ticks,\n       CASE WHEN state IS NOT NULL AND $t - state.tick <= $max_peer_age_ticks\n            THEN true ELSE false END AS state_fresh\nORDER BY robot_id",
+      "requires_tasks": false
+    },
+    {
+      "id": "w5",
+      "name": "self_feedback",
+      "category": "history",
+      "description": "刚才的操作有什么结果？我在等待、耗电还是持续没有进展？",
+      "temporal_scope": "event_window",
+      "cypher": "MATCH (:Run {id: $run_id})\nMATCH (robot:Robot {id: $run_id + ':robot:' + toString($robot_id), run_id: $run_id})\nCALL {\n  WITH robot\n  MATCH (state:AgentState {run_id: $run_id, robot_node_id: robot.id})\n  WHERE $from_tick < state.tick AND state.tick <= $t\n  WITH state ORDER BY state.tick DESC, state.id DESC LIMIT $state_fetch_limit\n  RETURN collect(state{.tick, .stage, .battery, .x, .y, .task_id, .cargo_id}) AS states\n}\nCALL {\n  WITH robot\n  MATCH (event:RuntimeEvent {run_id: $run_id, robot_node_id: robot.id})\n  WHERE $from_tick < event.tick AND event.tick <= $t\n  WITH event ORDER BY event.tick DESC, event.id DESC LIMIT $event_fetch_limit\n  RETURN collect(properties(event)) AS events\n}\nRETURN robot.robot_id AS robot_id, $from_tick AS from_tick, $t AS through_tick,\n       states, events, 'robot_node_id' AS event_scope",
+      "requires_tasks": false
+    },
+    {
+      "id": "w6",
+      "name": "task_timing",
+      "category": "feedback",
+      "description": "指定任务从分配到取货、完成分别观察到多长时间？是否有重新排队或多轮执行？",
+      "temporal_scope": "as_of",
+      "cypher": "MATCH (:Run {id:$run_id})\nUNWIND $task_ids AS requested_task_id\nCALL {\n  WITH requested_task_id\n  OPTIONAL MATCH (event:RuntimeEvent {run_id:$run_id, task_id:requested_task_id})\n  WHERE event.tick <= $t\n  RETURN count(event) AS observed_event_count,\n    sum(CASE WHEN event.type IN ['task_assigned','dataset_task_assigned'] THEN 1 ELSE 0 END) AS assignment_count,\n    min(CASE WHEN event.type IN ['task_assigned','dataset_task_assigned'] THEN event.time END) AS assigned_second,\n    sum(CASE WHEN event.type IN ['task_picked_up','picked'] THEN 1 ELSE 0 END) AS pickup_count,\n    min(CASE WHEN event.type IN ['task_picked_up','picked'] THEN event.time END) AS picked_second,\n    sum(CASE WHEN event.type IN ['task_completed','placed','shipped'] THEN 1 ELSE 0 END) AS completion_count,\n    min(CASE WHEN event.type IN ['task_completed','placed','shipped'] THEN event.time END) AS completed_second,\n    sum(CASE WHEN event.type = 'task_requeued' THEN 1 ELSE 0 END) AS requeue_count,\n    min(event.tick) AS first_observed_tick, max(event.tick) AS last_observed_tick\n}\nRETURN requested_task_id, observed_event_count > 0 AS task_observed, observed_event_count,\n       assignment_count, assigned_second, pickup_count, picked_second,\n       completion_count, completed_second, requeue_count,\n       first_observed_tick, last_observed_tick",
+      "requires_tasks": true
+    },
+    {
+      "id": "w7",
+      "name": "cargo_history",
+      "category": "custody",
+      "description": "这件货跨任务经历了哪些交接？哪些机器人最近的样本仍显示持有它？",
+      "temporal_scope": "as_of",
+      "cypher": "MATCH (:Run {id:$run_id})\nUNWIND $task_ids AS requested_task_id\nCALL {\n  WITH requested_task_id\n  OPTIONAL MATCH (:Execution {run_id:$run_id, task_id:requested_task_id})\n                 -[:EXECUTES]->(linked:WarehouseTask {task_id:requested_task_id})\n  WITH requested_task_id, collect(DISTINCT linked) AS linked_tasks\n  OPTIONAL MATCH (scoped:WarehouseTask {dataset_id:$dataset_id, task_id:requested_task_id})\n  WITH linked_tasks, collect(DISTINCT scoped) AS scoped_tasks\n  RETURN CASE WHEN size(linked_tasks) = 1 THEN linked_tasks[0]\n              WHEN size(linked_tasks) = 0 AND size(scoped_tasks) = 1 THEN scoped_tasks[0]\n              ELSE null END AS task,\n         CASE WHEN size(linked_tasks) = 1 THEN 'run_execution_link'\n              WHEN size(linked_tasks) > 1 THEN 'ambiguous_execution_links'\n              WHEN size(scoped_tasks) = 1 THEN 'run_dataset_namespace'\n              WHEN size(scoped_tasks) > 1 THEN 'ambiguous_static_definitions'\n              ELSE 'not_observed' END AS task_resolution\n}\nCALL {\n  WITH task\n  OPTIONAL MATCH (task)-[:CONCERNS]->(goods:Goods)\n  OPTIONAL MATCH (goods)-[:INITIAL_AT]->(location:Location)\n  RETURN collect(DISTINCT goods.goods_id) AS static_goods_ids,\n         collect(DISTINCT location{.location_id, .kind}) AS initial_locations\n}\nCALL {\n  WITH requested_task_id\n  OPTIONAL MATCH (state:ExecutionState {run_id:$run_id, task_id:requested_task_id})\n  WHERE state.tick <= $t AND state.cargo_id IS NOT NULL\n  RETURN collect(DISTINCT state.cargo_id) AS sampled_goods_ids\n}\nCALL {\n  WITH requested_task_id\n  OPTIONAL MATCH (event:RuntimeEvent {run_id:$run_id, task_id:requested_task_id})\n  WHERE event.tick <= $t AND event.cargo_id IS NOT NULL\n  RETURN collect(DISTINCT event.cargo_id) AS event_goods_ids\n}\nCALL {\n  WITH requested_task_id\n  OPTIONAL MATCH (handoff:Handoff {run_id:$run_id, task_id:requested_task_id})\n  WHERE handoff.tick <= $t AND handoff.goods_id IS NOT NULL\n  RETURN collect(DISTINCT handoff.goods_id) AS transferred_goods_ids\n}\nWITH requested_task_id, initial_locations,\n     reduce(ids=[], candidate IN static_goods_ids + sampled_goods_ids + event_goods_ids + transferred_goods_ids |\n       CASE WHEN candidate IN ids THEN ids ELSE ids + candidate END) AS goods_ids\nWITH requested_task_id, initial_locations, size(goods_ids) AS identity_count,\n     CASE WHEN size(goods_ids) = 1 THEN goods_ids[0] ELSE null END AS goods_id\nWITH goods_id, CASE WHEN goods_id IS NULL THEN requested_task_id ELSE null END AS unresolved_task_id,\n     collect(DISTINCT requested_task_id) AS selected_task_ids,\n     max(identity_count) AS cargo_identity_count,\n     reduce(locations=[], group IN collect(initial_locations) | locations + group) AS initial_locations\nCALL {\n  WITH goods_id\n  OPTIONAL MATCH (event:RuntimeEvent {run_id:$run_id, cargo_id:goods_id})\n  WHERE event.tick <= $t\n  WITH event ORDER BY event.tick DESC, event.id DESC LIMIT $event_fetch_limit\n  RETURN collect(properties(event)) AS cargo_events\n}\nCALL {\n  WITH goods_id\n  OPTIONAL MATCH (handoff:Handoff {run_id:$run_id, goods_id:goods_id})\n  WHERE handoff.tick <= $t\n  WITH handoff ORDER BY handoff.tick DESC, handoff.id DESC LIMIT $evidence_fetch_limit\n  RETURN collect(properties(handoff)) AS handoffs\n}\nCALL {\n  WITH goods_id\n  MATCH (robot:Robot {run_id:$run_id})\n  CALL {\n    WITH robot\n    OPTIONAL MATCH (exact:AgentState {id:robot.id+':state:'+toString($t),\n                                    run_id:$run_id, robot_node_id:robot.id, tick:$t})\n  CALL {\n    WITH robot, exact\n    WITH robot WHERE exact IS NULL\n    OPTIONAL MATCH (previous:AgentState {run_id:$run_id, robot_node_id:robot.id})\n    WHERE previous.tick <= $t\n    WITH previous ORDER BY previous.tick DESC, previous.id DESC LIMIT 1\n    RETURN head(collect(previous)) AS fallback\n  }\n  WITH coalesce(exact, fallback) AS state\n    RETURN state\n  }\n  RETURN count(robot) AS known_robots, count(state) AS robots_with_samples,\n    collect(CASE WHEN state.cargo_id = goods_id THEN\n      state{.robot_id, .tick, .task_id, .cargo_id, .stage,\n            age_ticks:$t-state.tick,\n            state_fresh:$t-state.tick <= $max_peer_age_ticks} ELSE null END) AS holder_observations\n}\nRETURN goods_id, selected_task_ids, cargo_identity_count, initial_locations,\n       cargo_events, handoffs, holder_observations, known_robots, robots_with_samples",
+      "requires_tasks": true
+    },
+    {
+      "id": "w8",
+      "name": "progress_summary",
+      "category": "progress",
+      "description": "整个观察窗口内有多少状态样本、空间和电量变化？静止判断的采样依据是否足够？",
+      "temporal_scope": "event_window",
+      "cypher": "MATCH (:Run {id:$run_id})\nMATCH (robot:Robot {id:$run_id+':robot:'+toString($robot_id), run_id:$run_id})\nCALL {\n  WITH robot\n  MATCH (state:AgentState {run_id:$run_id, robot_node_id:robot.id})\n  WHERE $from_tick < state.tick AND state.tick <= $t\n  RETURN count(state) AS sample_count, count(DISTINCT state.tick) AS sampled_tick_count,\n    min(state.tick) AS first_sample_tick, max(state.tick) AS last_sample_tick,\n    min(state.x) AS min_x, max(state.x) AS max_x,\n    min(state.y) AS min_y, max(state.y) AS max_y,\n    count(state.x) AS samples_with_x, count(state.y) AS samples_with_y,\n    min(state.battery) AS min_soc, max(state.battery) AS max_soc,\n    collect(DISTINCT state.stage) AS observed_stages\n}\nCALL {\n  MATCH (step:Step {run_id:$run_id})\n  WHERE $from_tick < step.tick AND step.tick <= $t AND step.complete = true\n  RETURN count(DISTINCT step.tick) AS observed_complete_ticks\n}\nRETURN sample_count, sampled_tick_count, first_sample_tick, last_sample_tick,\n       min_x, max_x, min_y, max_y, samples_with_x, samples_with_y,\n       min_soc, max_soc, observed_stages, observed_complete_ticks",
+      "requires_tasks": false
+    },
+    {
+      "id": "w9",
+      "name": "completion_feedback",
+      "category": "feedback",
+      "description": "本机最近实际完成了哪些任务？相对任务期限是提前还是延迟？",
+      "temporal_scope": "event_window",
+      "cypher": "MATCH (:Run {id:$run_id})\nMATCH (event:RuntimeEvent {run_id:$run_id, robot_node_id:$run_id+':robot:'+toString($robot_id)})\nWHERE $from_tick < event.tick AND event.tick <= $t\n  AND event.type IN ['task_completed','placed','shipped'] AND event.task_id IS NOT NULL\nWITH event.task_id AS requested_task_id, min(event.tick) AS completed_tick,\n     min(event.time) AS completed_second, count(event) AS completion_event_count\nORDER BY completed_tick DESC, requested_task_id LIMIT $result_fetch_limit\nCALL {\n  WITH requested_task_id\n  OPTIONAL MATCH (:Execution {run_id:$run_id, task_id:requested_task_id})\n                 -[:EXECUTES]->(linked:WarehouseTask {task_id:requested_task_id})\n  WITH requested_task_id, collect(DISTINCT linked) AS linked_tasks\n  OPTIONAL MATCH (scoped:WarehouseTask {dataset_id:$dataset_id, task_id:requested_task_id})\n  WITH linked_tasks, collect(DISTINCT scoped) AS scoped_tasks\n  RETURN CASE WHEN size(linked_tasks) = 1 THEN linked_tasks[0]\n              WHEN size(linked_tasks) = 0 AND size(scoped_tasks) = 1 THEN scoped_tasks[0]\n              ELSE null END AS task,\n         CASE WHEN size(linked_tasks) = 1 THEN 'run_execution_link'\n              WHEN size(linked_tasks) > 1 THEN 'ambiguous_execution_links'\n              WHEN size(scoped_tasks) = 1 THEN 'run_dataset_namespace'\n              WHEN size(scoped_tasks) > 1 THEN 'ambiguous_static_definitions'\n              ELSE 'not_observed' END AS task_resolution\n}\nOPTIONAL MATCH (dataset:Dataset {id:task.dataset_id})\nRETURN requested_task_id AS task_id, task_resolution, completed_tick, completed_second, completion_event_count,\n       task IS NOT NULL AS task_exists, task.task_type AS task_type,\n       task.due_time AS due_time, dataset.start AS dataset_start\nORDER BY completed_tick DESC, task_id",
+      "requires_tasks": false
+    },
+    {
+      "id": "w10",
+      "name": "recovery_markers",
+      "category": "recovery",
+      "description": "最近一次停机、解停或电量校正是什么？是否仍缺少晚于停机的恢复证据？",
+      "temporal_scope": "as_of",
+      "cypher": "MATCH (:Run {id:$run_id})\nMATCH (event:RuntimeEvent {run_id:$run_id, robot_node_id:$run_id+':robot:'+toString($robot_id)})\nWHERE event.tick <= $t AND event.type IN [\n  'robot_stopped','robot_stop_cleared','robot_reenabled','robot_power_isolated',\n  'battery_measurement_corrected','traffic_retimed','task_requeued']\nWITH event.type AS kind, max(event.tick) AS latest_tick\nMATCH (latest:RuntimeEvent {run_id:$run_id, robot_node_id:$run_id+':robot:'+toString($robot_id),\n                           type:kind, tick:latest_tick})\nRETURN properties(latest) AS marker\nORDER BY marker.tick DESC, marker.id DESC LIMIT $result_fetch_limit",
+      "requires_tasks": false
+    },
+    {
+      "id": "w11",
+      "name": "handoff_outcomes",
+      "category": "feedback",
+      "description": "本机最近参与的接力之后，是否观察到任务继续执行或完成？",
+      "temporal_scope": "event_window",
+      "cypher": "MATCH (:Run {id:$run_id})\nMATCH (handoff:Handoff {run_id:$run_id})\nWHERE $from_tick < handoff.tick AND handoff.tick <= $t\n  AND (handoff.donor_id = $robot_id OR handoff.receiver_id = $robot_id)\nWITH handoff ORDER BY handoff.tick DESC, handoff.id DESC LIMIT $result_fetch_limit\nCALL {\n  WITH handoff\n  OPTIONAL MATCH (state:ExecutionState {run_id:$run_id, task_id:handoff.task_id})\n  WHERE handoff.tick < state.tick AND state.tick <= $t\n  WITH state ORDER BY state.tick DESC, state.id DESC LIMIT 1\n  RETURN properties(state) AS post_transfer_sample\n}\nCALL {\n  WITH handoff\n  OPTIONAL MATCH (done:ExecutionState {run_id:$run_id, task_id:handoff.task_id, status:'completed'})\n  WHERE handoff.tick < done.tick AND done.tick <= $t\n  WITH done ORDER BY done.tick, done.id LIMIT 1\n  RETURN done.tick AS completion_tick\n}\nRETURN properties(handoff) AS handoff,\n  CASE WHEN handoff.donor_id = $robot_id THEN 'donor' ELSE 'receiver' END AS my_role,\n  post_transfer_sample, completion_tick,\n  CASE WHEN completion_tick IS NOT NULL THEN completion_tick-handoff.tick ELSE null END AS observed_completion_latency_ticks\nORDER BY handoff.tick DESC, handoff.id DESC",
+      "requires_tasks": false
+    },
+    {
+      "id": "w12",
+      "name": "rack_workload",
+      "category": "local_context",
+      "description": "哪些货架被已观察的机器人主任务同时引用？选任务时有哪些作业集中区域？",
+      "temporal_scope": "as_of",
+      "cypher": "MATCH (:Run {id:$run_id})\nMATCH (robot:Robot {run_id:$run_id})\nCALL {\n  WITH robot\n  OPTIONAL MATCH (exact:AgentState {id:robot.id+':state:'+toString($t),\n                                    run_id:$run_id, robot_node_id:robot.id, tick:$t})\n  CALL {\n    WITH robot, exact\n    WITH robot WHERE exact IS NULL\n    OPTIONAL MATCH (previous:AgentState {run_id:$run_id, robot_node_id:robot.id})\n    WHERE previous.tick <= $t\n    WITH previous ORDER BY previous.tick DESC, previous.id DESC LIMIT 1\n    RETURN head(collect(previous)) AS fallback\n  }\n  WITH coalesce(exact, fallback) AS state\n  RETURN state\n}\nWITH robot, state, state.task_id AS requested_task_id WHERE state.task_id IS NOT NULL\nCALL {\n  WITH requested_task_id\n  OPTIONAL MATCH (:Execution {run_id:$run_id, task_id:requested_task_id})\n                 -[:EXECUTES]->(linked:WarehouseTask {task_id:requested_task_id})\n  WITH requested_task_id, collect(DISTINCT linked) AS linked_tasks\n  OPTIONAL MATCH (scoped:WarehouseTask {dataset_id:$dataset_id, task_id:requested_task_id})\n  WITH linked_tasks, collect(DISTINCT scoped) AS scoped_tasks\n  RETURN CASE WHEN size(linked_tasks) = 1 THEN linked_tasks[0]\n              WHEN size(linked_tasks) = 0 AND size(scoped_tasks) = 1 THEN scoped_tasks[0]\n              ELSE null END AS task,\n         CASE WHEN size(linked_tasks) = 1 THEN 'run_execution_link'\n              WHEN size(linked_tasks) > 1 THEN 'ambiguous_execution_links'\n              WHEN size(scoped_tasks) = 1 THEN 'run_dataset_namespace'\n              WHEN size(scoped_tasks) > 1 THEN 'ambiguous_static_definitions'\n              ELSE 'not_observed' END AS task_resolution\n}\nOPTIONAL MATCH (task)-[:FROM|TO]->(location:Location)\nWHERE location.kind = 'slot'\nWITH robot, state, requested_task_id, task, task_resolution, location\nWHERE location IS NOT NULL OR task IS NULL\nRETURN location.rack_id AS rack_id,\n  collect(DISTINCT robot.robot_id) AS observed_robot_ids,\n  collect(DISTINCT requested_task_id) AS observed_task_ids,\n  collect(DISTINCT task_resolution) AS task_resolutions,\n  collect(DISTINCT location.level) AS referenced_slot_levels,\n  count(DISTINCT robot.robot_id) AS observed_robot_count,\n  count(DISTINCT CASE WHEN $t-state.tick <= $max_peer_age_ticks THEN robot.robot_id ELSE null END) AS fresh_reference_count,\n  min(state.tick) AS oldest_state_tick, max(state.tick) AS newest_state_tick\nORDER BY fresh_reference_count DESC, observed_robot_count DESC, rack_id\nLIMIT $result_fetch_limit",
+      "requires_tasks": false
+    },
+    {
+      "id": "w13",
+      "name": "port_pressure_history",
+      "category": "local_context",
+      "description": "已记录的出入库工位件数在最近快照中上升还是下降？是否需要重新评估工位选择？",
+      "temporal_scope": "event_window",
+      "cypher": "MATCH (:Run {id:$run_id})\nMATCH (snapshot:DispatchState {run_id:$run_id})\nWHERE $from_tick < snapshot.tick AND snapshot.tick <= $t\nRETURN snapshot.tick AS observed_tick, snapshot.commit_seq AS commit_seq,\n       snapshot.elapsed AS elapsed, snapshot.ports_json AS ports_json\nORDER BY observed_tick DESC, commit_seq DESC LIMIT $result_fetch_limit",
+      "requires_tasks": false
+    }
+  ]
+}

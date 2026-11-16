@@ -29,9 +29,11 @@ def load_registry(path):
     for ident,raw in data['datasets'].items():
         if not isinstance(ident,str) or not ident or not isinstance(raw,dict):raise ValueError('invalid dataset alias')
         entry=dict(raw)
-        for name in ('scene','dataset','disturbances_json','config_json'):
+        for name in ('scene','dataset','disturbances_json','config_json','locations_csv'):
             if entry.get(name) is not None:entry[name]=str((base/entry[name]).resolve())
         if not entry.get('scene') or not entry.get('dataset'):raise ValueError('dataset scene/path required')
+        if entry.get('mobility','legacy') not in ('legacy','wheeled'):
+            raise ValueError('registered mobility must be legacy or wheeled')
         datasets[ident]=entry
     return datasets,data.get('default_dataset')
 
@@ -41,7 +43,7 @@ def dataset_descriptions(datasets,selected=None):
     for ident,item in datasets.items():
         directory=Path(item['dataset']);manifest=directory/'manifest.json';scene=Path(item['scene'])
         available=scene.is_file() and all((directory/n).is_file() for n in ('tasks.csv','initial_inventory.csv','manifest.json'))
-        available=available and all(not item.get(n) or Path(item[n]).is_file() for n in ('config_json','disturbances_json'))
+        available=available and all(not item.get(n) or Path(item[n]).is_file() for n in ('config_json','disturbances_json','locations_csv'))
         row={'id':ident,'label':item.get('label',ident),'available':available,'task_count':None,'manifest_sha256':None}
         if available:
             try:
@@ -268,17 +270,33 @@ def create_app(runtime,datasets,dist,*,catalog_factory=None,catalog_description=
     @app.post('/api/control')
     async def control(request:Request):
         try:
-            body=_body(await request.body());allowed={'action','value','dataset_id','expected_run_id'}
+            body=_body(await request.body());allowed={'action','value','dataset_id','expected_run_id','run_id','max_ticks'}
             if set(body)-allowed:raise ValueError('unknown control field')
             action=body.get('action');value=body.get('value')
             if action not in ('start','resume','pause','step','speed','checkpoint','new_run'):
                 raise ValueError('choose start, pause, step, speed, checkpoint or new_run')
+            if 'run_id' in body and action!='new_run':
+                raise ValueError('run_id is only accepted when creating a new_run')
+            if 'max_ticks' in body and action!='new_run':
+                raise ValueError('max_ticks is only accepted when creating a new_run')
             if action=='new_run':
                 ident=body.get('dataset_id')
                 if ident not in datasets:raise ValueError('choose a registered dataset alias')
                 if not next(r['available'] for r in dataset_descriptions(datasets)['datasets'] if r['id']==ident):
                     raise ValueError('dataset input is unavailable')
                 value={'dataset_id':ident}
+                if 'max_ticks' in body:
+                    from ops.warehouse_live_runtime import max_tick_limit
+                    value['max_ticks']=max_tick_limit(body['max_ticks'])
+                if 'run_id' in body:
+                    from ops.warehouse_live_runtime import run_name
+                    name=body['run_id']
+                    if not isinstance(name,str):raise ValueError('runId 必须是文本，留空可自动生成')
+                    name=name.strip()
+                    if name:
+                        try:value['run_id']=run_name(name)
+                        except ValueError as exc:
+                            raise ValueError('runId 须为1～128位，以英文字母或数字开头，仅可包含字母、数字、下划线、短横线和点') from exc
             if action=='speed' and (type(value) not in (int,float) or not math.isfinite(value) or not .1<=value<=120):
                 raise ValueError('wall-clock speed must be within 0.1..120')
             expected=body.get('expected_run_id',runtime.latest().get('runId'))
@@ -347,12 +365,26 @@ def create_app(runtime,datasets,dist,*,catalog_factory=None,catalog_description=
 
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
+    sys.path.insert(0, str(ROOT))
+    from ops.warehouse_kg_config import Neo4jConnection, WRITE_MODES, env_bool, knowledge_backend, state_source
+    try:
+        env_backend = knowledge_backend(os.environ.get('KG_BACKEND', 'neo4j'))
+        env_state_source = state_source(os.environ.get('KG_STATE_SOURCE', 'memory'))
+        env_record = env_bool('KG_RECORD_AGENT_STATE')
+    except ValueError as exc:
+        p.error(str(exc))
     p.add_argument('--source-root',type=Path,default=ROOT)
     p.add_argument('--dist',type=Path,default=ROOT/'dist')
     p.add_argument('--registry',type=Path,default=ROOT/'config/live-datasets.json')
     p.add_argument('--output-root',type=Path,default=ROOT/'data/live-runs')
     p.add_argument('--dataset-id');p.add_argument('--mode',choices=('required','rules'),default='rules')
-    p.add_argument('--knowledge-backend',choices=('neo4j','journal'),default='neo4j')
+    p.add_argument('--knowledge-backend',choices=('neo4j','journal'),default=env_backend)
+    p.add_argument('--run-id', default=os.environ.get('KG_RUN_ID'))
+    p.add_argument('--kg-write-mode', choices=WRITE_MODES, default=os.environ.get('KG_WRITE_MODE'))
+    p.add_argument('--record-agent-state', action=argparse.BooleanOptionalAction, default=env_record)
+    p.add_argument('--neo4j-uri');p.add_argument('--neo4j-user');p.add_argument('--database')
+    p.add_argument('--no-journal',action='store_true',
+                   help='persist live commits directly in Neo4j; requires robot actors/global HTTP writer; fresh runs only')
     p.add_argument('--commit-seconds',type=int,default=5);p.add_argument('--resume-run-id')
     p.add_argument('--resource-graph',action='store_true',help='same-transaction rack resources for new runs')
     p.add_argument('--expected-neo4j-uri',help='refuse startup if the live database differs from this isolated endpoint')
@@ -374,7 +406,8 @@ def main(argv=None):
     p.add_argument('--mobility',choices=('legacy','wheeled'),default='legacy')
     p.add_argument('--ray',action='store_true',help='100 Ray motion actors; V5 dispatch/reservations remain central')
     p.add_argument('--ray-address',default=os.environ.get('RAY_ADDRESS'))
-    p.add_argument('--ray-actor-cpus',type=float,default=0.1)
+    p.add_argument('--ray-actor-cpus',type=float,default=None)
+    p.add_argument('--ray-num-cpus',type=int)
     p.add_argument('--robot-graph',action='store_true',help='each Ray actor writes its own robot graph subgraph')
     p.add_argument('--robot-graph-sync',dest='robot_graph_async',action='store_false',default=True,
                    help='use synchronous graph writes for comparison; memory dispatch defaults to bounded asynchronous writes')
@@ -384,9 +417,10 @@ def main(argv=None):
     p.add_argument('--initial-speed',type=float,default=1.0,help='initial wall-clock speed, 0.1..120')
     p.add_argument('--robot-processes',choices=('off','local','ray'),default='off',
                    help='robots advance in their own robot processes (local objects or one Ray actor each); same dispatch results')
-    p.add_argument('--kg-state-source', choices=('memory', 'neo4j'), default='memory',
+    p.add_argument('--kg-state-source', '--state-source', type=state_source, choices=('memory', 'neo4j'), default=env_state_source,
                    help='robot state input used by the main dispatcher')
-    p.add_argument('--graph-state-interval',type=int,default=4,help='AgentState cadence per robot actor, 1..300 ticks')
+    p.add_argument('--graph-state-interval',type=int,default=1 if os.environ.get('KG_RECORD_AGENT_STATE')=='1' else 4,
+                   help='AgentState cadence per robot actor, 1..300 ticks')
     p.add_argument('--global-writer',action='store_true',help='one plain child process writes global RunStat/global events')
     p.add_argument('--global-writer-queue',type=int,default=256,help='bounded global writer queue, 16..10000')
     p.add_argument('--global-writer-url',default=None,help='HTTP global record service, e.g. http://127.0.0.1:14284')
@@ -400,6 +434,12 @@ def main(argv=None):
     p.add_argument('--agent-timeout',type=float,default=30.)
     p.add_argument('--agent-startup-timeout',type=float,default=120.)
     args=p.parse_args(argv)
+    if args.kg_write_mode is not None and args.kg_write_mode not in WRITE_MODES:
+        p.error('KG_WRITE_MODE must be main, ray or process')
+    if args.ray_num_cpus is not None and (args.ray_num_cpus < 1 or args.ray_address not in (None, '', 'local')):
+        p.error('--ray-num-cpus requires a positive value and a local Ray cluster')
+    if args.ray_actor_cpus is None:
+        args.ray_actor_cpus=min(.1,args.ray_num_cpus/100) if args.ray_num_cpus is not None else .1
     if not 1<=args.robot_graph_backlog<=128:
         p.error('--robot-graph-backlog must be within 1..128')
     if args.max_active_robots is not None and not 1<=args.max_active_robots<=100:
@@ -416,8 +456,19 @@ def main(argv=None):
     available={r['id']:r['available'] for r in dataset_descriptions(datasets)['datasets']}
     if not available.get(selected):p.error('selected dataset is unavailable; generate/register its input first')
     if args.mode=='required' and args.knowledge_backend!='neo4j':p.error('required mode needs Neo4j')
+    if args.no_journal and (args.knowledge_backend!='neo4j' or args.mode!='rules'
+            or args.robot_processes!='ray' or not args.robot_graph or not (args.global_writer_url or args.kg_write_mode)
+            or args.legacy_a_graph or args.global_writer or args.resource_graph
+            or args.query_acceleration!='baseline' or args.query_point_file or args.query_upstream or args.resume_run_id):
+        p.error('--no-journal requires Neo4j rules mode, robot-processes ray, robot-graph and global-writer-url; '
+                'legacy graph, summaries and resume are unsupported')
     if args.query_acceleration=='summary' and args.knowledge_backend!='neo4j':p.error('summary queries need Neo4j point fences')
     if args.query_upstream and args.knowledge_backend!='neo4j':p.error('query-only upstreams need Neo4j mode')
+    connection = Neo4jConnection.from_env()
+    from dataclasses import replace
+    connection = replace(connection, **{key:value for key,value in
+        (('uri',args.neo4j_uri),('user',args.neo4j_user),('database',args.database)) if value is not None})
+    os.environ.update(connection.environment())
     sys.path.insert(0,str(ROOT));sys.path.insert(0,str(source))
     from ops.warehouse_live_runtime import WarehouseLiveRuntime
     from backend.query_catalog import QueryCatalogService
@@ -425,10 +476,7 @@ def main(argv=None):
     try:
         from backend.warehouse_graph_query import Neo4jWarehouseGraph
         kg_graph=Neo4jWarehouseGraph(
-            uri=os.environ.get('WAREHOUSE_NEO4J_URI') or os.environ.get('NEO4J_URI') or 'bolt://127.0.0.1:47687',
-            user=os.environ.get('WAREHOUSE_NEO4J_USER') or os.environ.get('NEO4J_USER') or 'neo4j',
-            password=os.environ.get('WAREHOUSE_NEO4J_PASSWORD') or os.environ.get('NEO4J_PASSWORD'),
-            database=os.environ.get('WAREHOUSE_NEO4J_DATABASE') or os.environ.get('NEO4J_DATABASE') or 'neo4j',
+            **connection.writer_config(),
             dataset_id=os.environ.get('WAREHOUSE_NEO4J_DATASET_ID'))
     except Exception:
         kg_graph=None
@@ -436,7 +484,8 @@ def main(argv=None):
     # the UI; the owner only receives existing inputs it can actually validate.
     active_datasets={key:spec for key,spec in datasets.items() if available.get(key)}
     runtime=WarehouseLiveRuntime(source_root=source,output_root=args.output_root,datasets=active_datasets,dataset_id=selected,
-        commit_seconds=args.commit_seconds,knowledge_mode=args.mode,knowledge_backend=args.knowledge_backend,
+        run_id=args.run_id,kg_write_mode=args.kg_write_mode,record_agent_state=args.record_agent_state,ray_num_cpus=args.ray_num_cpus,
+        commit_seconds=args.commit_seconds,knowledge_mode=args.mode,knowledge_backend=args.knowledge_backend,no_journal=args.no_journal,
         wall_interval=1.,resume_run_id=args.resume_run_id,expected_neo4j_uri=args.expected_neo4j_uri,resource_graph=args.resource_graph,
         query_summary_root=(args.summary_root or args.output_root) if args.query_acceleration=='summary' else None,
         query_summary_cache=args.query_summary_cache if args.query_acceleration=='summary' else None,

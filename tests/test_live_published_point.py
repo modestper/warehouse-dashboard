@@ -67,6 +67,10 @@ class PublishedPointTests(unittest.TestCase):
         owner.commit_seconds = 5
         owner.knowledge_mode = 'rules'
         owner.knowledge_backend = 'neo4j'
+        owner.no_journal = False
+        owner.kg_write_mode = None
+        owner.record_agent_state = True
+        owner._max_ticks = None
         owner.resource_graph_enabled = True
         owner._lock = threading.RLock()
         owner._changed = threading.Condition(owner._lock)

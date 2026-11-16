@@ -91,12 +91,13 @@ class RobotActor(RobotProcess):
 class RayRobotPool:
     """One RobotActor per robot; step_all fans out and collects with one ray.get."""
 
-    def __init__(self, robots, energy, charge_target_soc, *, address=None, actor_cpus=0.1,
+    def __init__(self, robots, energy, charge_target_soc, *, address=None, actor_cpus=0.1, num_cpus=None,
                  namespace='warehouse-robot-actors', graph=None):
         import ray
         self.ray = ray
         if not ray.is_initialized():
-            ray.init(address=address or os.environ.get('RAY_ADDRESS') or None, namespace=namespace,
+            cpu_options = {'num_cpus': num_cpus} if num_cpus is not None else {}
+            ray.init(address=address or os.environ.get('RAY_ADDRESS') or None, namespace=namespace, **cpu_options,
                      ignore_reinit_error=True, log_to_driver=False,
                      runtime_env={'env_vars': {'PYTHONPATH': str(ROOT)}})
         actor_class = ray.remote(concurrency_groups={'graph': 1})(RobotActor)
@@ -155,17 +156,21 @@ class RayRobotProcessSplit(RobotProcessSplit):
     """
     ray_address = None
     ray_actor_cpus = 0.1
+    ray_num_cpus = None
     GRAPH_BATCH_TICKS = 8
     GRAPH_RETRIES = 3
 
     def __init__(self, *args, robot_graph=False, graph_state_interval=4,
                  kg_state_source='memory', global_writer_url=None, robot_context_interval=10,
-                 robot_graph_async=True, robot_graph_backlog=120, **kwargs):
+                 robot_graph_async=True, robot_graph_backlog=120, graph_writer=None,
+                 record_agent_state=True, **kwargs):
+        self.graph_writer = graph_writer
+        self.record_agent_state = record_agent_state
         if type(robot_graph_async) is not bool:
             raise ValueError('robot_graph_async must be a boolean')
         if type(robot_graph_backlog) is not int or not 1 <= robot_graph_backlog <= 128:
             raise ValueError('robot_graph_backlog must be within 1..128')
-        self.robot_graph_async = bool(robot_graph_async and robot_graph and global_writer_url
+        self.robot_graph_async = bool(graph_writer is None and robot_graph_async and robot_graph and global_writer_url
                                       and kg_state_source == 'memory')
         self.robot_graph_backlog = robot_graph_backlog
         self._async_graph_queue = None
@@ -193,7 +198,7 @@ class RayRobotProcessSplit(RobotProcessSplit):
         self._async_context_windows = {}
         if kg_state_source not in ('memory', 'neo4j'):
             raise ValueError('kg_state_source must be memory or neo4j')
-        if kg_state_source == 'neo4j' and (not robot_graph or not global_writer_url):
+        if kg_state_source == 'neo4j' and (not robot_graph or not (global_writer_url or graph_writer)):
             raise ValueError('neo4j state requires --robot-processes ray --robot-graph --global-writer-url')
         self.kg_state_source = kg_state_source
         self.global_writer_url = global_writer_url
@@ -215,6 +220,9 @@ class RayRobotProcessSplit(RobotProcessSplit):
         self.run_metadata['robot_context_interval'] = robot_context_interval
         self.run_metadata['robot_graph_async'] = self.robot_graph_async
         self.run_metadata['robot_graph_backlog'] = robot_graph_backlog
+        if graph_writer is not None:
+            self.run_metadata['kg_write_mode'] = graph_writer.mode
+        self.run_metadata['record_agent_state'] = record_agent_state
         if self._robot_graph:
             self.run_metadata['robot_graph_writer'] = 'robot-actors'
             self.run_metadata['robot_graph_interval'] = graph_state_interval
@@ -222,8 +230,10 @@ class RayRobotProcessSplit(RobotProcessSplit):
     def _make_robot_pool(self):
         if self._robot_graph and self._graph_config is None:
             from ..ray_medium.sim import bootstrap_robot_graph
-            self._graph_config = bootstrap_robot_graph(self, self._graph_state_interval)
-            if self.robot_context_interval:
+            self._graph_config = bootstrap_robot_graph(self, self._graph_state_interval,
+                record_agent_state=self.record_agent_state, write_router=self.graph_writer,
+                context_queries=bool(self.robot_context_interval))
+            if self.robot_context_interval and self.graph_writer is None:
                 from ..warehouse_runtime_graph import Neo4jRuntimeGraphWriter
                 bootstrap = Neo4jRuntimeGraphWriter(**self._graph_config)
                 try:
@@ -231,7 +241,8 @@ class RayRobotProcessSplit(RobotProcessSplit):
                 finally:
                     bootstrap.close()
         return RayRobotPool(self.robots, self.energy, self.config.charge_target_soc,
-                            address=self.ray_address, actor_cpus=self.ray_actor_cpus, graph=self._graph_config)
+                            address=self.ray_address, actor_cpus=self.ray_actor_cpus,
+                            num_cpus=self.ray_num_cpus, graph=self._graph_config)
 
     def step(self):
         if self.kg_error:
@@ -255,7 +266,7 @@ class RayRobotProcessSplit(RobotProcessSplit):
                 self._enqueue_async_graph_frame()
             elif self._robot_graph:
                 self._emit_robot_graph()
-            if self.global_writer_url and not self.robot_graph_async:
+            if (self.global_writer_url or self.graph_writer) and not self.robot_graph_async:
                 self._submit_global_step()
         except GraphWaitCancelled:
             raise  # safe pre-dispatch yield for pause/shutdown; never latch kg_error
@@ -517,11 +528,8 @@ class RayRobotProcessSplit(RobotProcessSplit):
         if self.tick > target:
             raise ValueError('same-run graph rewind is unsupported; restore the latest boundary or use a new run')
         from .kg_state import KGStateReader
-        config = self._graph_config or {
-            'uri': os.environ.get('WAREHOUSE_NEO4J_URI') or os.environ.get('NEO4J_URI'),
-            'user': os.environ.get('WAREHOUSE_NEO4J_USER') or os.environ.get('NEO4J_USER', 'neo4j'),
-            'password': os.environ.get('WAREHOUSE_NEO4J_PASSWORD') or os.environ.get('NEO4J_PASSWORD'),
-            'database': os.environ.get('WAREHOUSE_NEO4J_DATABASE') or os.environ.get('NEO4J_DATABASE', 'neo4j')}
+        from ops.warehouse_kg_config import Neo4jConnection
+        config = self._graph_config or Neo4jConnection.from_env().writer_config()
         reader = KGStateReader(**{k: config[k] for k in ('uri', 'user', 'password', 'database')})
         try:
             from neo4j import Query
@@ -566,9 +574,10 @@ class RayRobotProcessSplit(RobotProcessSplit):
         receipt = self.flush_robot_graph()
         received = receipt['robots'] if receipt['tick'] == self.tick else []
         complete = len(received) == 100 and set(received) == set(self.robots)
-        if self.kg_state_source == 'neo4j' and not complete:
+        writer = getattr(self, 'graph_writer', None)
+        if (self.kg_state_source == 'neo4j' or writer is not None) and not complete:
             raise RuntimeError(f'incomplete robot receipts at tick {self.tick}')
-        if self._step_client is None:
+        if writer is None and self._step_client is None:
             self._step_client = GlobalRecordClient(self.global_writer_url, self.run_id, batch_size=128)
         pending = self.pending_events
         if len(pending) < self._global_cursor:
@@ -580,12 +589,16 @@ class RayRobotProcessSplit(RobotProcessSplit):
             identity=self.global_record_identity, commit_seq=self.tick,
             include_dispatch=self.tick % 5 == 0)
         record['step'] = {'tick': self.tick, 'expected_robot_count': 100,
-                          'received_robot_ids': received, 'complete': complete, 'source': 'ray-robot-actors'}
-        try:
-            self._step_client.submit(record)
-        except BufferFull:
-            self._step_client.flush(2.)
-            self._step_client.submit(record)
+                          'received_robot_ids': received, 'complete': complete,
+                          'source': f'warehouse-{writer.mode}-writer' if writer is not None else 'ray-robot-actors'}
+        if writer is not None:
+            writer.write_global(record)
+        else:
+            try:
+                self._step_client.submit(record)
+            except BufferFull:
+                self._step_client.flush(2.)
+                self._step_client.submit(record)
         self._global_cursor, self._global_tick = len(pending), self.tick
         self.kg_timing['write_ms'] = self.kg_timing.get('write_ms', 0.) + (time.perf_counter() - began) * 1000
 
@@ -623,6 +636,12 @@ class RayRobotProcessSplit(RobotProcessSplit):
         snapshots = robot_graph_snapshots(self, fresh, self.frame().get('backend', 'warehouse-robot-actors'))
         for owner, snapshot in snapshots.items():
             snapshot['current_robot'] = dict(self.robots[owner])
+        writer = getattr(self, 'graph_writer', None)
+        if writer is not None and writer.mode != 'ray':
+            self.graph_receipt = writer.write_robots(snapshots)
+            self._published_robots = {i: dict(r) for i, r in self.robots.items()}
+            self.kg_timing['write_ms'] = self.kg_timing.get('write_ms', 0.) + (time.perf_counter() - began) * 1000
+            return
         self._graph_pending.append((self.tick, snapshots, self._robot_pool().write_graph_all(snapshots)))
         if self.kg_state_source == 'neo4j' or len(self._graph_pending) >= self.GRAPH_BATCH_TICKS:
             self._collect_robot_graph()

@@ -15,6 +15,12 @@ class NativeLiveCliTests(unittest.TestCase):
         self.assertIn('--query-point-file',output.getvalue())
         self.assertIn('--query-upstream',output.getvalue())
         self.assertIn('--max-active-robots',output.getvalue())
+        self.assertIn('--no-journal',output.getvalue())
+
+    def test_no_journal_rejects_missing_graph_writers_before_startup(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exited:
+            main(['--no-journal'])
+        self.assertEqual(exited.exception.code, 2)
 
     def test_active_limit_rejects_invalid_arguments_before_startup(self):
         for value in ('0','-1','101','50.0','abc'):

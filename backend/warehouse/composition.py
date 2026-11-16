@@ -23,7 +23,7 @@ def _base_physical_classes(mobility='legacy'):
         return RayWheeledKnowledgeSimulation, WheeledConfig
     raise ValueError('unknown mobility model')
 
-def physical_classes(mobility='legacy', robot_processes='off', ray_address=None, ray_actor_cpus=0.1):
+def physical_classes(mobility='legacy', robot_processes='off', ray_address=None, ray_actor_cpus=0.1, ray_num_cpus=None):
     """Simulation and config classes for a mobility model.
 
     robot_processes: 'off' keeps the sequential engine; 'local' or 'ray' lets each
@@ -38,7 +38,7 @@ def physical_classes(mobility='legacy', robot_processes='off', ray_address=None,
         attrs = {}
     elif robot_processes == 'ray':
         from ..robot_actor.ray_actor import RayRobotProcessSplit as split
-        attrs = {'ray_address': ray_address, 'ray_actor_cpus': ray_actor_cpus}
+        attrs = {'ray_address': ray_address, 'ray_actor_cpus': ray_actor_cpus, 'ray_num_cpus': ray_num_cpus}
     else:
         raise ValueError('robot_processes must be off, local or ray')
     return type(f'{robot_processes.title()}RobotProcess{simulation_class.__name__}', (split, simulation_class), attrs), config_class

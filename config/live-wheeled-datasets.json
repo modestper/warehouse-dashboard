@@ -7,6 +7,8 @@
       "label": "轮式中型仓库：48架 / 1728高峰任务 / 自由口",
       "scene": "data/layouts/expansion-candidates/medium/layout.json",
       "dataset": "data/examples/wheeled-medium-peak",
+      "mobility": "wheeled",
+      "locations_csv": "data/layouts/expansion-candidates/medium/task-locations.csv",
       "graph_dataset_id": "dataset:warehouse-logical-boundaries-v1:2026-10-27",
       "config_json": "config/wheeled-medium-100.json"
     },
@@ -14,7 +16,9 @@
       "label": "轮式中型仓库：19任务与低电接力",
       "scene": "data/layouts/expansion-candidates/medium/layout.json",
       "dataset": "data/examples/wheeled-medium-sample19",
-      "graph_dataset_id": "dataset:warehouse-logical-boundaries-v1:2026-10-27",
+      "mobility": "wheeled",
+      "locations_csv": "data/layouts/expansion-candidates/medium/task-locations.csv",
+      "graph_dataset_id": "dataset:warehouse-live:medium19",
       "config_json": "config/wheeled-medium-100.json",
       "disturbances_json": "config/live-sample-disturbances.json"
     }

@@ -1,4 +1,4 @@
-import {normalizeDatasets,knowledgeFacts,buildQuery,formatClock} from './live-model.mjs';
+import {normalizeDatasets,knowledgeFacts,buildQuery,formatClock,newRunOptions,controlAvailability} from './live-model.mjs';
 import {legacyAQueriesEnabled} from './dashboard-view.mjs';
 
 // On-demand knowledge controls in the original dashboard. Rendering never queries ANN.
@@ -12,10 +12,25 @@ export function createKnowledgePanel({getFrame,getSelected,control,toast}) {
   $('datasetSelect').addEventListener('change',()=>{pendingDataset=$('datasetSelect').value;});
   $('stepButton').addEventListener('click',()=>control('step'));
   $('checkpointButton').addEventListener('click',()=>control('checkpoint'));
-  $('newRunButton').addEventListener('click',()=>{
-    if(getFrame()?.running)return toast('请先暂停再另开新run','!');
-    if(window.confirm('保留当前运行记录，另开所选数据集的新run？'))control('reset');
-  });
+  async function newRun(){
+    if(getFrame()?.running){toast('请先暂停再另开新run','!');return null;}
+    const input=$('newRunId');
+    const ticks=$('newRunMaxTicks').value;
+    try{newRunOptions($('datasetSelect').value,'',ticks);}
+    catch(error){toast(error.message,'!');$('newRunMaxTicks').focus();return null;}
+    const requested=window.prompt(`保留当前运行记录，另开所选数据集的新 run。\n最大 tick：${ticks.trim()||'不限制'}，达到上限自动暂停。\n请输入新 runId（留空自动生成，取消则不新建）：`,input.value);
+    if(requested===null)return null;
+    input.value=requested;
+    try{newRunOptions($('datasetSelect').value,requested,ticks);}
+    catch(error){toast(error.message,'!');input.focus();return null;}
+    const snapshot=await control('reset');
+    if(snapshot){
+      if(input.value===requested)input.value='';
+      toast(`已保留旧记录，新 runId：${snapshot.runId} · 最大 tick：${snapshot.maxTicks??'不限制'}`);
+    }
+    return snapshot;
+  }
+  $('newRunButton').addEventListener('click',newRun);
   $('fillSelected').addEventListener('click',()=>{const r=getSelected();if(!r)return;
     $('queryRobot').value=r.id;$('queryTask').value=r.taskId||'';$('queryGoods').value=r.cargoId||'';});
   $('latestQuery').addEventListener('change',()=>{$('querySeq').disabled=$('latestQuery').checked;});
@@ -53,13 +68,14 @@ export function createKnowledgePanel({getFrame,getSelected,control,toast}) {
       `持久化 ${k.durable} / 图谱 ${k.mirrored} / 滞后 ${k.lag}批 · 物理 ${formatClock(f.elapsed)} / 图谱 ${formatClock(k.committedTime)}${k.error?` · 写入错误 ${k.error}`:''}`:
       '旧版 A 查询已停用；C 图谱状态见运行状态栏';
     $('runIdentity').textContent=f.runId;
+    $('runTickLimit').textContent=`当前 tick：${f.tick} / ${f.maxTicks??'不限'}${f.tickLimitReached?' · 已达到上限，另开新 run 可重新设置':''}`;
     $('runMetadata').textContent=JSON.stringify({runId:f.runId,sourceKind:f.sourceKind,metadata:meta,knowledge:f.knowledge},null,2);
     if($('latestQuery').checked)$('querySeq').value=k.mirrored;
-    $('stepButton').disabled=!['paused','ready'].includes(f.status);
+    $('stepButton').disabled=!controlAvailability(f).step;
     $('checkpointButton').disabled=f.status==='failed';
     $('newRunButton').disabled=f.running||!datasets.length;
     $('runQuery').disabled=!legacyEnabled||queryBusy||!(k.mirrored>0);
     $('sceneVersion').textContent=f.specVersion||'V5';
   }
-  return {apply,duration:id=>datasets.find(d=>d.id===id)?.duration_seconds};
+  return {apply,newRun,duration:id=>datasets.find(d=>d.id===id)?.duration_seconds};
 }

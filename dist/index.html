@@ -9,7 +9,7 @@
       content="100 台轻量人形机器人协同完成取货、搬运和多层货架上架任务的可交互仓储仿真控制台。"
     />
     <title>100台人形机器人仓储调度台</title>
-    <link rel="stylesheet" href="./styles.css?v=20261031-kg-link" />
+    <link rel="stylesheet" href="./styles.css?v=20261109-max-ticks" />
   </head>
   <body>
     <div class="app-shell">
@@ -142,8 +142,15 @@
               <h3>固定数据集</h3><select id="datasetSelect" aria-label="下一次运行的数据集"></select>
               <p id="datasetDetail">等待真实输入</p>
               <button class="button ghost" id="stepButton">单步1秒</button><button class="button ghost" id="checkpointButton">保存检查点</button>
+              <label class="new-run-label" for="newRunId">新 runId（可选）</label>
+              <input id="newRunId" type="text" maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}" placeholder="例如 exp-20261104-01" autocomplete="off" spellcheck="false" aria-describedby="newRunIdHint" />
+              <p id="newRunIdHint">点击下方按钮后可在弹窗输入编号，也可在此预填。留空自动生成；支持英文字母、数字、下划线、短横线和点，须以字母或数字开头，最多128位。</p>
+              <label class="new-run-label" for="newRunMaxTicks">最大 tick（可选）</label>
+              <input id="newRunMaxTicks" type="number" min="1" max="2147483647" step="1" inputmode="numeric" placeholder="例如 10000；留空不限制" aria-describedby="newRunMaxTicksHint" />
+              <p id="newRunMaxTicksHint">与新 runId 一起用于下次运行。填写正整数；从 tick 0 开始，到达上限自动暂停并保存记录。任务全部结束时可能提前完成。</p>
               <button class="button primary" id="newRunButton">保留记录，另开新run</button>
               <p>先暂停再切换输入。旧run与图谱保留。</p><code id="runIdentity">等待run身份</code>
+              <p id="runTickLimit" aria-live="polite">当前 tick 上限：等待运行</p>
             </section>
 <p id="sceneCapacity" style="font-size:11px;color:#9baa9f">格位容量等待后端</p>
           </aside>
@@ -293,6 +300,6 @@
       <span id="toastIcon">✓</span><p id="toastText">操作已完成</p>
     </div>
 
-    <script type="module" src="./app.js?v=20261031-default-60x"></script>
+    <script type="module" src="./app.js?v=20261109-max-ticks"></script>
   </body>
 </html>

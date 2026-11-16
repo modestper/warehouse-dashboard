@@ -1,0 +1,68 @@
+{
+  "status": "energy_exhausted_absorbing_state",
+  "config_file": "config.json",
+  "processed_steps": 823,
+  "end_time_minute": 690.3333333333482,
+  "end_time_label": "11:30:20",
+  "peaks_until_stop": {
+    "delivering": 99,
+    "business_positive_battery": 90,
+    "moving": 92,
+    "carrying": 41,
+    "dispatch_business_positive_battery": 91
+  },
+  "first_all_delivering": null,
+  "peak_observations": {
+    "delivering": {
+      "value": 99,
+      "step": 651,
+      "time_minute": 633.0000000000083,
+      "time_label": "10:33:00",
+      "boundary": "after_motion"
+    },
+    "business_positive_battery": {
+      "value": 90,
+      "step": 622,
+      "time_minute": 623.3333333333405,
+      "time_label": "10:23:20",
+      "boundary": "after_motion"
+    },
+    "moving": {
+      "value": 92,
+      "step": 627,
+      "time_minute": 625.0000000000074,
+      "time_label": "10:25:00",
+      "boundary": "after_motion"
+    },
+    "carrying": {
+      "value": 41,
+      "step": 639,
+      "time_minute": 629.0000000000078,
+      "time_label": "10:29:00",
+      "boundary": "after_motion"
+    },
+    "dispatch_business_positive_battery": {
+      "value": 91,
+      "step": 626,
+      "time_minute": 624.3333333333406,
+      "time_label": "10:24:20",
+      "boundary": "after_dispatch"
+    }
+  },
+  "absorbing_state": {
+    "step": 823,
+    "time_minute": 690.3333333333482,
+    "time_label": "11:30:20",
+    "zero_energy_drones": 100,
+    "min_distance_to_any_charger_m": 31.785662900638314,
+    "statuses": {
+      "delivering": 97,
+      "returning": 3
+    },
+    "proof": "all batteries exactly zero; no drone at any charger; only motion-to-depot can recharge; no external interventions configured"
+  },
+  "witness": null,
+  "completed_tasks_at_stop": 1242,
+  "wall_seconds": 46.40430963016115,
+  "whole_day_completed": false
+}

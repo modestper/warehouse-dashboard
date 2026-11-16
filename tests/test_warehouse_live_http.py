@@ -88,6 +88,40 @@ class LiveHTTPTests(unittest.TestCase):
             self.assertEqual(client.post('/api/control',json={'action':'reset'}).status_code,400)
             self.assertEqual(client.post('/api/control',json={'action':'start','dataset_path':'arbitrary'}).status_code,400)
             self.assertEqual(client.post('/api/tasks/batch',json={'count':100}).status_code,405)
+    def test_new_run_custom_id_and_empty_auto_id(self):
+        with TestClient(self.app()) as client:
+            for name in ('experiment-20261104_01.v2','a'*128):
+                response=client.post('/api/control',json={'action':'new_run','dataset_id':'sample',
+                    'run_id':' '+name+' ','expected_run_id':'fixture'})
+                self.assertEqual(response.status_code,200)
+                self.assertEqual(self.runtime.commands[-1],('new_run',{'dataset_id':'sample','run_id':name},'fixture'))
+            for name in ('','   '):
+                self.assertEqual(client.post('/api/control',json={'action':'new_run','dataset_id':'sample','run_id':name}).status_code,200)
+                self.assertEqual(self.runtime.commands[-1][1],{'dataset_id':'sample'})
+    def test_invalid_custom_id_never_reaches_owner(self):
+        with TestClient(self.app()) as client:
+            for name in (None,True,123,[],{},'../old','a/b','a\\b','.hidden','中文','a b','a'*129):
+                with self.subTest(name=name):
+                    response=client.post('/api/control',json={'action':'new_run','dataset_id':'sample','run_id':name})
+                    self.assertEqual(response.status_code,400)
+            self.assertEqual(client.post('/api/control',json={'action':'pause','run_id':'other'}).status_code,400)
+            self.assertEqual(self.runtime.commands,[])
+    def test_new_run_max_ticks_is_typed_and_sent_with_run_id(self):
+        with TestClient(self.app()) as client:
+            for limit in (1,10000,2147483647,None):
+                response=client.post('/api/control',json={'action':'new_run','dataset_id':'sample',
+                    'run_id':'limited-run','max_ticks':limit,'expected_run_id':'fixture'})
+                self.assertEqual(response.status_code,200)
+                self.assertEqual(self.runtime.commands[-1],('new_run',
+                    {'dataset_id':'sample','run_id':'limited-run','max_ticks':limit},'fixture'))
+    def test_invalid_tick_limit_rejected_before_owner_and_other_actions_cannot_change_it(self):
+        with TestClient(self.app()) as client:
+            for limit in (True,False,0,-1,1.5,'10000','',[],{},2147483648):
+                with self.subTest(limit=limit):
+                    response=client.post('/api/control',json={'action':'new_run','dataset_id':'sample','max_ticks':limit})
+                    self.assertEqual(response.status_code,400)
+            self.assertEqual(client.post('/api/control',json={'action':'start','max_ticks':100}).status_code,400)
+            self.assertEqual(self.runtime.commands,[])
     def test_graph_query_defaults_are_one_run_immutable_point(self):
         with TestClient(self.app()) as client:
             response=client.post('/api/knowledge/query',json={'query_id':'self','robot_id':1})

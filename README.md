@@ -58,6 +58,16 @@ python -m backend.warehouse serve --output data/runs/my-smoke --port 14183
 
 ## 120×90 中型布局与轮式运行
 
+使用 Neo4j 保存全部图谱与提交、不创建本地 SQLite journal 的完整启动入口：
+
+```bash
+./run_in_lade.sh python ops/start_neo4j_live.py --database warehouse
+```
+
+脚本提示输入密码，默认在14583启动独立页面；兼容LaDe的 `KG_BACKEND`、`KG_RUN_ID`、`KG_WRITE_MODE=main/ray/process`、`KG_STATE_SOURCE`、`KG_RECORD_AGENT_STATE` 和 `NEO4J_*` 环境变量。连接检查、静态导入和有状态Ray仿真由同一个启动器处理。三种实际写入模式、完整命令及恢复边界见 [Neo4j 无 journal 启动说明](docs/NEO4J_ONLY_START.md)。
+
+现有9套任务集已统一注册到 `config/live-datasets.json`，Neo4j 启动器支持通过 `--dataset-id` 选择，并自动绑定原地图、配置和扰动。执行 `./run_in_lade.sh python ops/start_neo4j_live.py --list-datasets` 可离线查看全部别名；完整对应关系见[数据集注册与启动](docs/REGISTERED_DATASETS.md)。
+
 `wz/warehouse-design` 的 medium 候选（120×90m、48架、2304货位、100泊位）已迁入本分支的 `data/layouts/expansion-candidates/medium/`，配套 `data/examples/wheeled-medium-*`、`config/wheeled-medium-100.json` 和 `backend/wheeled/`。
 
 ```bash

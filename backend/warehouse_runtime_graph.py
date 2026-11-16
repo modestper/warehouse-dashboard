@@ -90,11 +90,12 @@ def v5_runtime_snapshot(sim: Any, events: Iterable[dict[str, Any]]) -> dict[str,
 class Neo4jRuntimeGraphWriter:
     """Persist bounded batches; callers may safely drop intermediate snapshots."""
 
-    def __init__(self, *, uri: str, user: str, password: str | None, database: str = "neo4j", dataset_id: str | None = None, state_interval_ticks: int = 4, driver: Any | None = None, driver_factory: Callable[..., Any] | None = None):
+    def __init__(self, *, uri: str, user: str, password: str | None, database: str = "neo4j", dataset_id: str | None = None, state_interval_ticks: int = 4, record_agent_state: bool = True, driver: Any | None = None, driver_factory: Callable[..., Any] | None = None):
         if state_interval_ticks < 1:
             raise ValueError("state_interval_ticks must be positive")
         self.uri, self.user, self.password, self.database, self.dataset_id = uri, user, password, database, dataset_id
         self.state_interval_ticks = state_interval_ticks
+        self.record_agent_state = record_agent_state
         self.driver, self.driver_factory = driver, driver_factory
         self.schema_ready = False
         self.last_run_id = ""
@@ -166,7 +167,7 @@ class Neo4jRuntimeGraphWriter:
                         session.run(query).consume()
                     self.schema_ready = True
                 event_rows = self._event_rows(snapshot, run_id)
-                write_state = tick % self.state_interval_ticks == 0 or tick == 1
+                write_state = self.record_agent_state and (tick % self.state_interval_ticks == 0 or tick == 1)
                 robots = self._robot_rows(snapshot, run_id) if write_state else []
                 execution_rows = self._execution_rows(robots, event_rows, tick)
                 execution_states = self._execution_state_rows(execution_rows)
@@ -234,7 +235,7 @@ class Neo4jRuntimeGraphWriter:
                         session.run(query).consume()
                     self.schema_ready = True
                 event_rows = self._event_rows(snapshot, run_id)
-                write_state = tick % self.state_interval_ticks == 0 or tick == 1
+                write_state = self.record_agent_state and (tick % self.state_interval_ticks == 0 or tick == 1)
                 robots = self._robot_rows(snapshot, run_id) if write_state else []
                 execution_rows = self._execution_rows(robots, event_rows, tick)
                 execution_states = self._execution_state_rows(execution_rows)

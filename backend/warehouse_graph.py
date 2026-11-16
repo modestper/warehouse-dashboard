@@ -156,7 +156,7 @@ class WarehouseGraphPackage:
         }
 
 
-def load_graph_package(package_dir: Path, layout_path: Path, locations_path: Path) -> WarehouseGraphPackage:
+def load_graph_package(package_dir: Path, layout_path: Path, locations_path: Path, *, dataset_id: str | None = None) -> WarehouseGraphPackage:
     """Load a generated day package and fail before any database write if invalid."""
     package_dir, layout_path, locations_path = Path(package_dir), Path(layout_path), Path(locations_path)
     manifest = json.loads((package_dir / "manifest.json").read_text(encoding="utf-8"))
@@ -172,7 +172,10 @@ def load_graph_package(package_dir: Path, layout_path: Path, locations_path: Pat
             raise ValueError(f"manifest hash does not match {name}")
     layout_version = layout["spec"]["version"]
     warehouse_id = f"warehouse:{layout_version}"
-    dataset_id = f"dataset:{manifest['version']}:{manifest['start'][:10]}"
+    if dataset_id is None:
+        dataset_id = f"dataset:{manifest['version']}:{manifest['start'][:10]}"
+    elif not isinstance(dataset_id, str) or not dataset_id.startswith('dataset:') or not dataset_id.removeprefix('dataset:').strip():
+        raise ValueError('graph dataset_id must be a nonempty dataset: identifier')
     racks_by_id = {rack["id"]: rack for rack in layout["racks"]}
     raw_locations = _rows(locations_path)
     raw_inventory, raw_tasks = _rows(package_dir / "initial_inventory.csv"), _rows(package_dir / "tasks.csv")
@@ -244,7 +247,7 @@ def load_graph_package(package_dir: Path, layout_path: Path, locations_path: Pat
         "outbound": manifest["outbound"],
         "initial_inventory": manifest["initial_inventory"],
         "capacity": manifest["capacity"],
-        "source": manifest["source"],
+        "source": manifest.get("source", ""),
         "boundary_routing_json": json.dumps(manifest.get("boundary_routing", {}), ensure_ascii=False, sort_keys=True),
         "assumptions_json": json.dumps(manifest.get("assumptions", {}), ensure_ascii=False, sort_keys=True),
         "files_json": json.dumps(manifest.get("files", {}), ensure_ascii=False, sort_keys=True),

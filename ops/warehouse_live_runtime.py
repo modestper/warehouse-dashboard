@@ -60,6 +60,12 @@ def positive_speed(value):
     return float(value)
 
 
+def max_tick_limit(value):
+    if value is not None and (type(value) is not int or not 1 <= value <= 2_147_483_647):
+        raise ValueError('最大 tick 须为 1～2147483647 的整数，留空不限制')
+    return value
+
+
 def validate_disturbances(value):
     if not isinstance(value, list):
         raise ValueError('disturbances must be a list')
@@ -113,7 +119,7 @@ def _load_core(root):
 class WarehouseLiveRuntime:
     def __init__(self, *, source_root, output_root, datasets, dataset_id,
                  run_id=None, config=None, commit_seconds=5, knowledge_mode='rules',
-                 knowledge_backend='journal', wall_interval=1., disturbances_json=None,
+                 knowledge_backend='journal', no_journal=False, wall_interval=1., disturbances_json=None,
                  resume_run_id=None, expected_neo4j_uri=None, startup_timeout=180, resource_graph=False,
                  query_summary_root=None, query_summary_cache=None, query_point_path=None,
                  mobility='legacy', robot_agents=False, agent_options=None, max_active_robots=None,
@@ -121,7 +127,21 @@ class WarehouseLiveRuntime:
                  robot_graph=False, graph_state_interval=4,
                  global_writer=False, global_writer_queue=256, global_writer_url=None,
                  kg_state_source='memory', legacy_a_graph=False, robot_context_interval=10,
-                 robot_graph_async=True, robot_graph_backlog=120, autostart=False, initial_speed=1.0):
+                 robot_graph_async=True, robot_graph_backlog=120, autostart=False, initial_speed=1.0,
+                 kg_write_mode=None, record_agent_state=True, ray_num_cpus=None):
+        from ops.warehouse_kg_config import WRITE_MODES
+        if kg_write_mode is not None and kg_write_mode not in WRITE_MODES:
+            raise ValueError('KG_WRITE_MODE must be main, ray or process')
+        if type(record_agent_state) is not bool:
+            raise ValueError('record_agent_state must be boolean')
+        if ray_num_cpus is not None and (type(ray_num_cpus) is not int or ray_num_cpus < 1):
+            raise ValueError('ray_num_cpus must be a positive integer')
+        self.kg_write_mode, self.record_agent_state = kg_write_mode, record_agent_state
+        self.ray_num_cpus = ray_num_cpus
+        if kg_write_mode is not None and (not no_journal or not robot_graph or robot_processes != 'ray'
+                or knowledge_backend != 'neo4j' or global_writer_url or global_writer):
+            raise ValueError('KG_WRITE_MODE routing requires Neo4j --no-journal, robot-processes ray and robot-graph; '
+                             'global writes are owned by the selected mode, not an external writer')
         # 4173 passes --autostart (lys): a fresh run starts advancing at once.
         # Restored runs always stay paused; other launchers keep ready + Start.
         self.autostart=bool(autostart)
@@ -139,7 +159,7 @@ class WarehouseLiveRuntime:
         self.legacy_a_graph = legacy_a_graph
         if kg_state_source not in ('memory', 'neo4j'):
             raise ValueError('kg_state_source must be memory or neo4j')
-        if kg_state_source == 'neo4j' and (robot_processes != 'ray' or not robot_graph or not global_writer_url):
+        if kg_state_source == 'neo4j' and (robot_processes != 'ray' or not robot_graph or not (global_writer_url or kg_write_mode)):
             raise ValueError('neo4j state requires --robot-processes ray --robot-graph --global-writer-url')
         self.kg_state_source = kg_state_source
         if max_active_robots is not None and (type(max_active_robots) is not int or not 1<=max_active_robots<=100):
@@ -155,8 +175,6 @@ class WarehouseLiveRuntime:
             raise ValueError('Ray medium execution requires mobility=wheeled')
         if robot_processes not in ('off','local','ray'):
             raise ValueError('robot_processes must be off, local or ray')
-        if robot_processes!='off' and mobility!='wheeled':
-            raise ValueError('robot processes require mobility=wheeled')
         if robot_processes!='off' and self.ray:
             raise ValueError('choose either --ray (motion actors) or --robot-processes, not both')
         self.robot_processes=robot_processes
@@ -181,6 +199,17 @@ class WarehouseLiveRuntime:
         # HTTP global record service (lys, e.g. 14284); records are sent in tick order
         # by backend.global_record_client. Independent of the --global-writer queue path.
         self.global_writer_url=global_writer_url
+        if type(no_journal) is not bool:
+            raise ValueError('no_journal must be boolean')
+        if no_journal:
+            if (knowledge_backend != 'neo4j' or knowledge_mode != 'rules' or legacy_a_graph
+                    or robot_processes != 'ray' or not robot_graph or not (global_writer_url or kg_write_mode)
+                    or global_writer or resource_graph or query_summary_root is not None or query_point_path is not None):
+                raise ValueError('--no-journal requires Neo4j rules mode, --robot-processes ray, '
+                                 '--robot-graph and --global-writer-url, without legacy graph options')
+            if resume_run_id:
+                raise ValueError('--no-journal does not support --resume-run-id; use a fresh run')
+        self.no_journal = no_journal
         self._global_client=None
         self._global_client_run=None
         self.robot_agents=robot_agents
@@ -229,8 +258,10 @@ class WarehouseLiveRuntime:
         self._query_summary_status=None
         self.registry = {}
         for alias, spec in datasets.items():
-            if not isinstance(alias, str) or not isinstance(spec, dict) or set(spec) - {'scene', 'dataset', 'config', 'config_json', 'disturbances_json', 'label', 'graph_dataset_id'}:
+            if not isinstance(alias, str) or not isinstance(spec, dict) or set(spec) - {'scene', 'dataset', 'config', 'config_json', 'disturbances_json', 'label', 'graph_dataset_id', 'mobility', 'locations_csv'}:
                 raise ValueError('invalid registered dataset specification')
+            if spec.get('mobility',mobility) not in ('legacy','wheeled'):
+                raise ValueError('registered mobility must be legacy or wheeled')
             normalized = deepcopy(spec)
             normalized['scene'] = str(Path(spec['scene']).resolve(strict=True))
             normalized['dataset'] = str(Path(spec['dataset']).resolve(strict=True))
@@ -262,6 +293,7 @@ class WarehouseLiveRuntime:
         self._latest = None
         self._state = 'initializing'
         self._error = None
+        self._max_ticks = None
         self._store = self._provider = self._sim = None
         self._stopping = False
         self._ready = Future()
@@ -284,7 +316,8 @@ class WarehouseLiveRuntime:
     def status(self):
         snap = self.latest()
         return {key: snap.get(key) for key in ('runId', 'runtimeInstanceId', 'status', 'running', 'elapsed', 'tick',
-                                              'speed', 'knowledge', 'metadata', 'lastError', 'liveRevision')}
+                                              'speed', 'knowledge', 'metadata', 'lastError', 'liveRevision',
+                                              'maxTicks', 'tickLimitReached', 'stopReason')}
 
     def query_point(self):
         """Atomically fence a query without copying the fleet/map/UI snapshot."""
@@ -393,14 +426,14 @@ class WarehouseLiveRuntime:
             if not future.done():
                 future.set_exception(RuntimeError('live worker shut down before applying command'))
 
-    def _create_run(self, dataset_id, *, run_id=None, config=None, resume=False):
+    def _create_run(self, dataset_id, *, run_id=None, config=None, resume=False, max_ticks=None):
         names = ('_output', '_dataset_id', '_identity', '_sim', '_store', '_provider',
                  '_disturbances', '_applied', '_done', '_events', '_error', '_last_commit',
                  '_rate_points', '_run_started', '_state', '_scene', '_query_summary_status',
-                 '_last_query_point', '_published_scene', '_latest', '_revision')
+                 '_last_query_point', '_published_scene', '_latest', '_revision', 'mobility', '_max_ticks')
         previous = {name: getattr(self, name, None) for name in names}
         try:
-            self._create_run_impl(dataset_id, run_id=run_id, config=config, resume=resume)
+            self._create_run_impl(dataset_id, run_id=run_id, config=config, resume=resume, max_ticks=max_ticks)
         except Exception as exc:
             if self._store is not previous['_store']:
                 try:self._close()
@@ -430,10 +463,14 @@ class WarehouseLiveRuntime:
             finally:
                 raise RuntimeError('prior live run resource cleanup failed; all resources attempted')
 
-    def _create_run_impl(self, dataset_id, *, run_id=None, config=None, resume=False):
+    def _create_run_impl(self, dataset_id, *, run_id=None, config=None, resume=False, max_ticks=None):
+        max_ticks = max_tick_limit(max_ticks)
         if dataset_id not in self.registry:
             raise ValueError('unknown registered dataset_id')
         spec = self.registry[dataset_id]
+        mobility = spec.get('mobility', self.mobility)
+        if self.ray and mobility != 'wheeled':
+            raise ValueError('Ray motion actors require a wheeled dataset; use robot-processes ray for mixed registries')
         run_id = run_name(run_id or ('wh-live-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ-') + uuid.uuid4().hex[:8]))
         output = (self.output_root / run_id).resolve()
         if output.parent != self.output_root or output == self.source_root:
@@ -448,19 +485,20 @@ class WarehouseLiveRuntime:
         # written back into the dataset configuration file.
         if self.max_active_robots is not None:
             cfg['max_active_robots']=self.max_active_robots
-        if self.mobility=='legacy':
+        if mobility=='legacy' and self.robot_processes=='off':
             simulation_class,config_class=self._core.sim.KnowledgeSimulation,self._core.writer.Config
         else:
             from backend.warehouse.composition import physical_classes
-            simulation_class,config_class=physical_classes('wheeled_ray' if self.ray else self.mobility,
-                robot_processes=getattr(self,'robot_processes','off'),ray_address=self.ray_address,ray_actor_cpus=self.ray_actor_cpus)
+            simulation_class,config_class=physical_classes('wheeled_ray' if self.ray else mobility,
+                robot_processes=getattr(self,'robot_processes','off'),ray_address=self.ray_address,ray_actor_cpus=self.ray_actor_cpus,
+                ray_num_cpus=self.ray_num_cpus)
         physical_config = config_class(**cfg)
         disturbance_path = spec.get('disturbances_json') or self.default_disturbances
         disturbances = json.loads(Path(disturbance_path).read_text(encoding='utf-8')) if disturbance_path else []
         validate_disturbances(disturbances)
         identity = {'version': VERSION, 'run_id': run_id, 'dataset_id': dataset_id,
                     'graph_dataset_id': spec.get('graph_dataset_id') or dataset_id,
-                    'mobility':self.mobility, 'ray':self.ray, 'ray_actor_cpus':self.ray_actor_cpus,
+                    'mobility':mobility, 'ray':self.ray, 'ray_actor_cpus':self.ray_actor_cpus,
                     'robot_processes':getattr(self,'robot_processes','off'),
                     'kg_state_source':self.kg_state_source,
                     'ray_address':self.ray_address, 'robot_graph':self.robot_graph,
@@ -481,6 +519,13 @@ class WarehouseLiveRuntime:
                     'knowledge_mode': self.knowledge_mode, 'knowledge_backend': self.knowledge_backend,
                     'resource_graph':self.resource_graph_enabled,
                     'disturbance_sha256': digest(disturbances)}
+        if self.no_journal:
+            identity['local_journal'] = False
+        if max_ticks is not None:
+            identity['max_ticks'] = max_ticks
+        if self.kg_write_mode is not None:
+            identity.update(kg_write_mode=self.kg_write_mode, record_agent_state=self.record_agent_state,
+                            ray_num_cpus=self.ray_num_cpus)
         if self.query_summary_root is not None:
             identity['query_summary']='source-journal-derived-exact-cutoff-v1'
         # Ray actor graph writers read this environment variable in
@@ -492,13 +537,17 @@ class WarehouseLiveRuntime:
             if any(output.glob('failure-*.json')):
                 raise ValueError('failed boundary requires explicit operator reconciliation before resume')
             old = json.loads((output / 'live-manifest.json').read_text(encoding='utf-8'))
+            if max_ticks is None and old.get('max_ticks') is not None:
+                max_ticks = max_tick_limit(old['max_ticks'])
+                identity['max_ticks'] = max_ticks
             if old != identity:
                 raise ValueError('owned live source/input/config/adapter identity changed; refusing resume')
         elif output.exists():
             raise FileExistsError('existing run output preserved; choose a new run_id')
         if self.knowledge_backend == 'neo4j':
+            from ops.warehouse_kg_config import Neo4jConnection
             uri = (os.environ.get('NEO4J_URI') if self.legacy_a_graph else
-                   os.environ.get('WAREHOUSE_NEO4J_URI') or os.environ.get('NEO4J_URI'))
+                   Neo4jConnection.from_env().uri)
             if not uri or self.expected_neo4j_uri and uri != self.expected_neo4j_uri:
                 raise ValueError('live Neo4j URI differs from its explicit isolated target')
         # Validate core/input before closing a previous completed/paused run.
@@ -511,9 +560,23 @@ class WarehouseLiveRuntime:
                               kg_state_source=self.kg_state_source, global_writer_url=self.global_writer_url,
                               robot_graph_async=self.robot_graph_async, robot_graph_backlog=self.robot_graph_backlog,
                               robot_context_interval=self.robot_context_interval)
-        sim = simulation_class(spec['scene'], spec['dataset'], run_id,
-            physical_config, commit_seconds=self.commit_seconds, knowledge_mode=self.knowledge_mode,
-            **sim_kwargs)
+            if not self.record_agent_state:
+                sim_kwargs['record_agent_state'] = False
+        routed_writer = None
+        if self.kg_write_mode is not None:
+            from ops.warehouse_kg_config import Neo4jConnection
+            from backend.warehouse_knowledge_writer import WarehouseKnowledgeWriter
+            routed_writer = WarehouseKnowledgeWriter(self.kg_write_mode, Neo4jConnection.from_env().writer_config(),
+                ray_address=self.ray_address, ray_num_cpus=self.ray_num_cpus)
+            sim_kwargs.update(graph_writer=routed_writer, record_agent_state=self.record_agent_state)
+        try:
+            sim = simulation_class(spec['scene'], spec['dataset'], run_id,
+                physical_config, commit_seconds=self.commit_seconds, knowledge_mode=self.knowledge_mode,
+                **sim_kwargs)
+        except BaseException:
+            if routed_writer is not None:
+                routed_writer.close()
+            raise
         sim.run_metadata['kg_state_source'] = self.kg_state_source
         sim.global_record_identity = identity
         sim.context_log_path = str(output / 'robot-context.jsonl')
@@ -535,13 +598,21 @@ class WarehouseLiveRuntime:
         try:
             if mirror and not resume and mirror.query('MATCH (r:WHRun {run_id:$run}) RETURN count(r) AS runs', {'run': run_id})[0]['runs']:
                 raise ValueError('graph run_id already exists; old run is protected')
-            store = self._core.knowledge.JournalKnowledgeStore(output / 'journal.sqlite', mirror)
+            if routed_writer is not None:
+                store = routed_writer
+            elif self.no_journal:
+                from backend.neo4j_live_store import Neo4jLiveStore
+                store = Neo4jLiveStore.from_env()
+            else:
+                store = self._core.knowledge.JournalKnowledgeStore(output / 'journal.sqlite', mirror)
         except BaseException:
             if mirror:
                 mirror.close()
             raise
         self._output, self._dataset_id, self._identity = output, dataset_id, identity
+        self.mobility = mobility
         self._sim, self._store = sim, store
+        self._max_ticks = max_ticks
         self._query_summary_status=None
         self._provider = None
         self._disturbances, self._applied, self._done = disturbances, [], set()
@@ -551,6 +622,10 @@ class WarehouseLiveRuntime:
         self._rate_points = deque(maxlen=60)
         self._rate_points.append((time.monotonic(), sim.elapsed))
         self._run_started = time.monotonic()
+        if max_ticks is not None:
+            # Core restore verifies run_metadata before accepting the saved
+            # physical state, so install the same run limit before restoring.
+            sim.run_metadata['max_ticks'] = max_ticks
         if resume:
             state = store.recovery_payload(self._core.checkpoint.read_checkpoint(output / 'checkpoint.json'))
             if state.get('experiment', {}).get('disturbance_sha256') != digest(disturbances):
@@ -585,6 +660,28 @@ class WarehouseLiveRuntime:
             self._write_results()
         self._publish()
 
+    def _check_new_run_id(self, run_id):
+        run_name(run_id)
+        if (self.output_root / run_id).exists():
+            raise ValueError('runId 已存在，原记录已保留，请使用新编号')
+        if self.knowledge_backend == 'neo4j':
+            from neo4j import GraphDatabase, Query
+            from ops.warehouse_kg_config import Neo4jConnection
+            connection = Neo4jConnection.from_env()
+            try:
+                with GraphDatabase.driver(connection.uri, auth=(connection.user, connection.password),
+                                          connection_timeout=5, connection_acquisition_timeout=5) as driver:
+                    with driver.session(database=connection.database, default_access_mode='READ') as session:
+                        for query in ('MATCH (r:Run {id:$run_id}) RETURN r.id AS existing',
+                                      'MATCH (h:WarehouseLiveCheckpoint {run_id:$run_id}) RETURN h.run_id AS existing',
+                                      'MATCH (r:WHRun {run_id:$run_id}) RETURN r.run_id AS existing'):
+                            if session.run(Query(query, timeout=5), run_id=run_id).single() is not None:
+                                raise ValueError('runId 已存在于知识图谱，原记录已保留，请使用新编号')
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise ValueError('暂时无法检查图谱中的 runId，请稍后重试；当前运行已保留') from exc
+
     def _control(self, action, value, expected):
         cancel = getattr(self._sim, 'graph_wait_cancel_event', None)
         if cancel is not None:
@@ -594,9 +691,14 @@ class WarehouseLiveRuntime:
         if action in ('new_run', 'newrun'):
             if self._state == 'running':
                 raise ValueError('pause the current run before creating a new run')
-            if not isinstance(value, dict) or set(value) - {'dataset_id', 'run_id', 'config'}:
-                raise ValueError('new_run accepts only registered dataset_id, optional run_id and config')
-            self._create_run(value.get('dataset_id', self._dataset_id), run_id=value.get('run_id'), config=value.get('config'))
+            if not isinstance(value, dict) or set(value) - {'dataset_id', 'run_id', 'config', 'max_ticks'}:
+                raise ValueError('new_run accepts only registered dataset_id, optional run_id, max_ticks and config')
+            if 'max_ticks' in value:
+                max_tick_limit(value['max_ticks'])
+            if value.get('run_id') is not None:
+                self._check_new_run_id(value['run_id'])
+            options = {'max_ticks': value['max_ticks']} if 'max_ticks' in value else {}
+            self._create_run(value.get('dataset_id', self._dataset_id), run_id=value.get('run_id'), config=value.get('config'), **options)
             return self.latest()
         if action == 'shutdown':
             if self._state != 'failed':
@@ -611,6 +713,8 @@ class WarehouseLiveRuntime:
             return self.latest()
         if self._state == 'failed':
             raise ValueError('failed run preserved; create an explicit new_run or restart with matching owned resume')
+        if action in ('start', 'resume', 'step') and self._tick_limit_reached():
+            raise ValueError(f'已达到最大 tick {self._max_ticks}，请设置新的上限并另开新 run')
         if action in ('speed', 'set_speed'):
             self._speed = positive_speed(value)
             self._physical(self._publish)
@@ -653,12 +757,8 @@ class WarehouseLiveRuntime:
         if not getattr(self, "global_writer_enabled", False) or self._global_writer is not None:
             return
         from backend.global_writer import GlobalWriterProcess
-        config = {
-            'uri': os.environ.get('WAREHOUSE_NEO4J_URI') or os.environ.get('NEO4J_URI') or 'bolt://127.0.0.1:47687',
-            'user': os.environ.get('WAREHOUSE_NEO4J_USER') or os.environ.get('NEO4J_USER') or 'neo4j',
-            'password': os.environ.get('WAREHOUSE_NEO4J_PASSWORD') or os.environ.get('NEO4J_PASSWORD'),
-            'database': os.environ.get('WAREHOUSE_NEO4J_DATABASE') or os.environ.get('NEO4J_DATABASE') or 'neo4j',
-        }
+        from ops.warehouse_kg_config import Neo4jConnection
+        config = Neo4jConnection.from_env().writer_config()
         self._global_writer = GlobalWriterProcess(config, max_queue=self.global_writer_queue)
 
     def _record_global_http(self, sim, events):
@@ -688,6 +788,9 @@ class WarehouseLiveRuntime:
             self._global_writer_error = type(exc).__name__ + ': ' + str(exc)
 
     def _record_global(self, sim, events):
+        if getattr(sim, 'graph_writer', None) is not None:
+            sim._global_cursor = sim._graph_cursor = 0
+            return
         if getattr(sim, 'global_writer_url', None):
             # Stateful actors submit exactly once per tick, including between saves.
             # Reset cursors before _persist replaces pending_events.
@@ -838,8 +941,17 @@ class WarehouseLiveRuntime:
                 raise RuntimeError(f'disturbance {index} was not safely recovered')
             self._persist()
 
+    def _tick_limit_reached(self):
+        limit = getattr(self, '_max_ticks', None)
+        return limit is not None and self._sim.tick >= limit
+
     def _advance_one(self, force_persist=False):
         sim = self._sim
+        if self._tick_limit_reached():
+            sim.running = False
+            self._state = 'paused'
+            self._publish_timed()
+            return
         self._disturb()
         if sim.knowledge_boundary_due() and sim.elapsed != self._last_commit:
             self._persist()
@@ -853,7 +965,8 @@ class WarehouseLiveRuntime:
             sim.graph_wait_cancel_event.clear()
             return  # no physical step was started; let the owner process its control queue
         self._note_loop('sim_step', began)
-        if force_persist or sim.elapsed - self._last_commit >= self.commit_seconds:
+        limit_reached = self._tick_limit_reached()
+        if not limit_reached and (force_persist or sim.elapsed - self._last_commit >= self.commit_seconds):
             if not force_persist:
                 # Let the browser animate this frame while the save runs. The
                 # frame still reports the previous durable/mirrored seq, so
@@ -867,6 +980,16 @@ class WarehouseLiveRuntime:
                 raise RuntimeError('input complete but requested disturbances remain unexercised')
             sim.running = False
             self._state = 'complete'
+            self._persist()
+            self._write_results()
+        elif limit_reached:
+            # Drain accepted graph work at this boundary before saving. Never
+            # advance physics again, even when an async writer is still busy.
+            sim.running = False
+            self._state = 'paused'
+            flush = getattr(sim, 'flush_robot_graph', None)
+            if flush is not None:
+                flush()
             self._persist()
             self._write_results()
         elif force_persist:
@@ -915,6 +1038,8 @@ class WarehouseLiveRuntime:
         first, last = self._rate_points[0], self._rate_points[-1]
         rate = (last[1] - first[1]) / max(1e-9, last[0] - first[0]) if len(self._rate_points) > 1 else 0.
         snap.update(status=self._state, speed=self._speed, generatedAtMs=stamp, capturedAtMs=stamp,
+                    maxTicks=getattr(self, '_max_ticks', None), tickLimitReached=self._tick_limit_reached(),
+                    stopReason='max_ticks' if self._tick_limit_reached() and self._state != 'complete' else None,
                     runtimeInstanceId=self.runtime_instance_id,
                     sourceKind='live_simulation_memory', lastError=self._error, knowledge=knowledge,
                     events=deepcopy(list(self._events) + self._sim.pending_events)[-100:],
@@ -933,6 +1058,10 @@ class WarehouseLiveRuntime:
         if self._sim.run_metadata.get('boundary_routing'):
             snap['metadata']['boundary_routing']=deepcopy(self._sim.run_metadata['boundary_routing'])
         snap['metadata']['mobility']=getattr(self,'mobility','legacy')
+        snap['metadata']['local_journal']=not self.no_journal
+        snap['metadata']['max_ticks']=getattr(self, '_max_ticks', None)
+        snap['metadata']['kg_write_mode']=self.kg_write_mode
+        snap['metadata']['record_agent_state']=self.record_agent_state
         snap['metadata']['robot_processes']=getattr(self,'robot_processes','off')
         snap['metadata']['kg_state_source']=getattr(self, 'kg_state_source', 'memory')
         snap['metadata']['robot_graph_async']=bool(getattr(self._sim, 'robot_graph_async', False))
@@ -1014,6 +1143,8 @@ class WarehouseLiveRuntime:
         def quantile(q):
             return flow[min(len(flow) - 1, max(0, math.ceil(len(flow) * q) - 1))] if flow else 0
         result = {'run_id': sim.run_id, 'status': self._state, 'error': self._error, 'elapsed': sim.elapsed,
+            'max_ticks':self._max_ticks,
+            'stop_reason':'max_ticks' if self._tick_limit_reached() and self._state != 'complete' else None,
             'wall_seconds': time.monotonic() - self._run_started, 'config': asdict(sim.config),
             'input_identity': {k: self._identity[k] for k in ('scene_sha256', 'tasks_sha256', 'initial_inventory_sha256', 'manifest_sha256')},
             'code_identity': sim.run_metadata['execution_code_sha256'], 'tasks_total': len(sim.tasks),

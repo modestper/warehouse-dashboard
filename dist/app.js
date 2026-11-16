@@ -1674,7 +1674,7 @@ import {samePhysicalFrame,progressPresentation,platformStageProgress,platformTas
       document.body.classList.add('platform-fixed');
       $("#priorityTaskButton").hidden=true;$("#taskBatchButton").hidden=true;
       $("#queueMode").textContent="执行中 · 最多4台";
-      $("#playButton").disabled=["failed","complete"].includes(raw.status);
+      $("#playButton").disabled=["failed","complete"].includes(raw.status)||raw.tickLimitReached===true;
       $("#platformControls").hidden=false;$("#legacyFlow").hidden=true;$("#resetButton").title='保留旧run，在已暂停时另开所选数据集';
       $("#timelineLabel").textContent='固定数据集进度';$("#timelineStart").textContent='第1天 00:00';$("#timelineEnd").textContent='输入结束';
       knowledgePanel?.apply(raw);
@@ -1775,7 +1775,7 @@ import {samePhysicalFrame,progressPresentation,platformStageProgress,platformTas
     if(controlBusy)return null;
     controlBusy=true;
     try {
-      const payload=platformFrame?platformControl(action,value,platformFrame,$("#datasetSelect").value):{action,value};
+      const payload=platformFrame?platformControl(action,value,platformFrame,$("#datasetSelect").value,$("#newRunId").value,$("#newRunMaxTicks").value):{action,value};
       const response=await backendPost("/api/control",payload);const snapshot=response.snapshot||response;
       for(const held of frameBuffer.flush())applyBackendSnapshot(held);
       applyBackendSnapshot(snapshot);return snapshot;
@@ -2036,8 +2036,7 @@ import {samePhysicalFrame,progressPresentation,platformStageProgress,platformTas
 
     $("#resetButton").addEventListener("click", () => {
       if (backendConnected) {
-        if(platformFrame?.running)return showToast("请先暂停，再另开新run；旧记录会保留","!");
-        if(platformFrame&&!window.confirm("保留当前运行记录，另开所选数据集的新run？"))return;
+        if(platformFrame){knowledgePanel.newRun().then(snapshot=>{if(snapshot)resetView();});return;}
         sendBackendControl("reset").then((snapshot) => {
           if (snapshot) {
             resetView();

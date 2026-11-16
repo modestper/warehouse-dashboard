@@ -1,0 +1,41 @@
+{
+  "status": "read_only_plan",
+  "run_id": "million-110902",
+  "components": [
+    {
+      "name": "Neo4j Kernel",
+      "versions": [
+        "5.26.32"
+      ],
+      "edition": "community"
+    }
+  ],
+  "source": {
+    "nodes": 1196138,
+    "relationships": 2536722,
+    "cross_boundary_relationships": [],
+    "heads": [
+      {
+        "id": "4:2949e92a-8b3c-4505-953b-4d015c8f2258:763773",
+        "latest_step": null,
+        "updated_tick": null,
+        "seq": 2002,
+        "tick": 10000,
+        "committed_seq": null
+      },
+      {
+        "id": "4:2949e92a-8b3c-4505-953b-4d015c8f2258:763775",
+        "latest_step": 10000,
+        "updated_tick": 10000,
+        "seq": null,
+        "tick": null,
+        "committed_seq": null
+      }
+    ]
+  },
+  "agent_states": {
+    "n": 1000100,
+    "first_tick": 0,
+    "last_tick": 10000
+  }
+}

@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "status": "design_only_not_integrated",
+  "execution_verified": false,
+  "target": "current Warehouse100 C graph",
+  "rules": [
+    "read_only",
+    "fixed_run_and_tick",
+    "dataset_scoped_tasks",
+    "missing_is_unknown",
+    "candidate_is_not_claim",
+    "no_apoc"
+  ],
+  "queries": [
+    {
+      "id": "basis",
+      "title": "本次决策依据",
+      "business_question": "我在什么运行、什么完成步上决策？自己的观测是否可用？",
+      "trigger": "每次新决策首先执行一次，其他查询复用返回的 t、dataset_id、step.elapsed。",
+      "sample_parameters": {
+        "run_id": "YOUR_RUN_ID",
+        "robot_id": 1,
+        "at_tick": null,
+        "max_state_age_ticks": 4
+      },
+      "cypher": "MATCH (run:Run {id: $run_id})\nWITH run, coalesce($at_tick, run.latest_step) AS t\nOPTIONAL MATCH (step:Step {run_id: $run_id, tick: t})\nWITH run, t, collect(step) AS steps\nCALL {\n  WITH run\n  OPTIONAL MATCH (run)-[:USES_DATASET]->(dataset:Dataset)\n  RETURN collect(DISTINCT dataset{.id, .start, .time_unit, .warehouse_id}) AS datasets\n}\nCALL {\n  WITH run, t\n  OPTIONAL MATCH (robot:Robot {id: $run_id + ':robot:' + toString($robot_id), run_id: $run_id})\n  OPTIONAL MATCH (state:AgentState {run_id: $run_id, robot_node_id: robot.id})\n  WHERE state.tick <= t\n  WITH robot, state ORDER BY state.tick DESC, state.id DESC LIMIT 1\n  RETURN robot.type AS robot_type,\n         state{.tick, .stage, .battery, .x, .y, .task_id, .cargo_id} AS self_state\n}\nRETURN run.id AS run_id, t, run.latest_step AS published_tick,\n       size(steps) AS step_count,\n       CASE WHEN size(steps) = 1 THEN properties(steps[0]) ELSE null END AS step,\n       datasets, robot_type, self_state,\n       t - self_state.tick AS state_age_ticks,\n       run.config_json AS config_json,\n       run.scene_sha256 AS scene_sha256, run.tasks_sha256 AS tasks_sha256,\n       CASE WHEN size(steps) = 1 AND steps[0].complete = true\n                 AND steps[0].received_robot_count >= steps[0].expected_robot_count\n                 AND steps[0].expected_robot_count > 0\n                 AND t <= run.latest_step\n                 AND size(datasets) = 1 AND robot_type IS NOT NULL\n                 AND self_state IS NOT NULL AND t - self_state.tick <= $max_state_age_ticks\n            THEN true ELSE false END AS observation_ready",
+      "interpretation": "\n    **存在理由：**没有统一的时间锚点，后面的“我空闲、任务待领、同伴空闲”可能来自不同时间；缺状态也可能被误判成空闲。\n\n    - `at_tick=null` 表示固定读取一次 `Run.latest_step`，显式历史 tick 必须有对应完成步，不能自动跳到别的时间。\n    - `datasets` 必须恰好一个；后续 `$dataset_id` 来自这里，不能填前端显示名 `medium19` 代替图谱完整 ID。\n    - `max_state_age_ticks=4` 仅为示例容忍度，不是当前系统统一常量。取货、放货、交接等动作前还要取得当前执行器的即时状态。\n    - `observation_ready` 只说明基础观测满足上述条件。还必须检查必要字段非空、SOC 在 `[0,100]`、坐标有限、配置可解析；它不是动作授权。\n    - 查不到 Run 返回零行；查到 Run 但缺 Step/状态会显式返回缺项。`Robot.type` 只作为运行内稳定型号读取，不读取其可变的电量、任务或阶段作为历史状态。\n    "
+    },
+    {
+      "id": "task_pool",
+      "title": "已观察到的候选任务池",
+      "business_question": "我空闲时，有哪些已释放的任务值得进一步评估？",
+      "trigger": "机器人准备接新任务，或上一批候选失效时；同一运行和时间锚点可共享一次读取。",
+      "sample_parameters": {
+        "run_id": "YOUR_RUN_ID",
+        "dataset_id": "ANCHOR_DATASET_ID",
+        "t": 100,
+        "max_snapshot_age_ticks": 5
+      },
+      "cypher": "MATCH (:Run {id: $run_id})-[:USES_DATASET]->(:Dataset {id: $dataset_id})\nOPTIONAL MATCH (snapshot:DispatchState {run_id: $run_id, dataset_id: $dataset_id})\nWHERE snapshot.tick <= $t\nWITH snapshot ORDER BY snapshot.tick DESC, snapshot.commit_seq DESC LIMIT 1\nRETURN snapshot IS NOT NULL AS has_snapshot,\n       snapshot.tick AS observed_tick, $t - snapshot.tick AS age_ticks,\n       CASE WHEN snapshot IS NOT NULL AND $t - snapshot.tick <= $max_snapshot_age_ticks\n            THEN true ELSE false END AS snapshot_fresh,\n       snapshot.elapsed AS snapshot_elapsed,\n       snapshot.pending_json AS pending_json,\n       snapshot.active_jobs_json AS active_jobs_json,\n       snapshot.tasks_json AS tasks_json,\n       snapshot.ports_json AS ports_json,\n       'bounded_queue_total_unknown' AS completeness",
+      "interpretation": "\n    **存在理由：**静态 `WarehouseTask` 包含整天的未来任务，不能把它们全部当成当前可领取任务。此查询提供运行中实际观察到的队列。\n\n    组装器解析 JSON，先保留 `waiting/accepted` 且 `release_second <= basis.step.elapsed` 的条目，再结合 `active_jobs`、`task_evidence` 排除已观察到的占用。返回的是“进一步评估候选”，不是已认领任务，也不是完整的库存就绪队列。保留拒绝原因，例如 `not_released / observed_assigned / stale_snapshot`。\n\n    `pending_json` 写入前最多取原队列前200条；落库节点没有 `pending_count`，不能准确知道遗漏多少。200条时标记“可能截断”；不足200条也不证明任务池实时完整。没有快照、快照陈旧、JSON 损坏、确实观察到空队列，必须分开表示。快照时间容忍度由决策策略指定，示例5不是写者频率保证。\n\n    `active_jobs_json` 不是完整道路预约；`ports_json` 是件数汇总，不能据此宣称某货位或工位已为本机保留。若计划挑选未绑定逻辑边界任务，物理工位须另由实际工位选择逻辑确定并原子确认。\n    "
+    },
+    {
+      "id": "task_geometry",
+      "title": "指定任务的取放要求与物理目标",
+      "business_question": "这个任务到哪里取、到哪里放？我的机械臂能完成剩余操作吗？",
+      "trigger": "评估 task_pool 中的任务、执行本机任务、评估某次接力时；任务定义和布局按版本缓存，边界绑定仍按 t 读取。",
+      "sample_parameters": {
+        "run_id": "YOUR_RUN_ID",
+        "dataset_id": "ANCHOR_DATASET_ID",
+        "t": 100,
+        "task_ids": [
+          "KNOWN_TASK_ID"
+        ],
+        "binding_fetch_limit": 17
+      },
+      "cypher": "MATCH (:Run {id: $run_id})-[:USES_DATASET]->(dataset:Dataset {id: $dataset_id})\n      -[:USES_LAYOUT]->(warehouse:Warehouse)\nCALL {\n  WITH warehouse\n  MATCH (warehouse)-[:HAS_LOCATION]->(port:Location)\n  WHERE port.kind IN ['inbound', 'outbound']\n  RETURN collect(port{.location_id, .kind, .x, .y}) AS physical_ports\n}\nUNWIND $task_ids AS requested_task_id\nOPTIONAL MATCH (dataset)-[:INCLUDES_TASK]->(task:WarehouseTask {task_id: requested_task_id})\nOPTIONAL MATCH (task)-[:CONCERNS]->(goods:Goods)\nOPTIONAL MATCH (task)-[:FROM]->(source:Location)\nOPTIONAL MATCH (task)-[:TO]->(target:Location)\nOPTIONAL MATCH (warehouse)-[:HAS_RACK]->(source_rack:Rack)-[:HAS_SLOT]->(source)\nOPTIONAL MATCH (warehouse)-[:HAS_RACK]->(target_rack:Rack)-[:HAS_SLOT]->(target)\nCALL {\n  WITH task\n  OPTIONAL MATCH (event:RuntimeEvent {run_id: $run_id,\n                  task_id: task.task_id, type: 'boundary_port_bound'})\n  WHERE event.tick <= $t\n  WITH event ORDER BY event.tick DESC, event.id DESC LIMIT $binding_fetch_limit\n  RETURN collect(properties(event)) AS boundary_bindings\n}\nRETURN requested_task_id, task IS NOT NULL AS task_exists,\n       properties(task) AS task, goods.goods_id AS goods_id,\n       dataset.start AS dataset_start, properties(warehouse) AS warehouse_spec,\n       properties(source) AS source, properties(target) AS target,\n       properties(source_rack) AS source_rack, properties(target_rack) AS target_rack,\n       physical_ports, boundary_bindings",
+      "interpretation": "\n    **存在理由：**任务截止时间和地面坐标都无法代替机械臂取放要求；高层取货与高层放货对接力的要求不同。\n\n    - 批量参数 `task_ids` 仅来自已观察候选、本机任务或明确接力请求，去重后最多32项。返回静态定义不代表任务已释放或可领取。\n    - `source/target` 返回 `kind/level/face/bay/rack_id/x/y` 等真实字段。`dataset_start` 用于将任务 ISO 时间换算为运行秒；期限余量为 `due_second - basis.step.elapsed`，不能拿 tick 直接减 ISO 时间。\n    - 货位要求复用 `backend/wide/capabilities.py` 的 `slot_requirement()`；型号限制复用 `access_reason()`，不要在 Cypher 中再维护 A1/R2/X3 的第二套常量。完整任务检查源与目标；只有已确认取货/交接、正在执行剩余投递时，才仅检查目标，相当于 `task_capability_reason(..., remaining=True)`。\n    - 逻辑 `INBOUND/OUTBOUND` 不是实际坐标。解析绑定事件的 `details_json` 或 `payload`，按 `endpoint` 找 `actual_id`，再从 `physical_ports` 取坐标；没有有效绑定时返回 `needs_port_selection`。不能用 `(0,0)` 兜底。\n    - `binding_fetch_limit=17` 表示最多展示16条并用第17条识别截断；缺绑定、截断无法确认最新端点、同 tick 冲突，均保留未知。无 APOC 依赖，JSON 解析放在组装器。\n    - 当前静态导入存在 Rack ID 与 `Location.rack_node_id` 不一致的问题，`HAS_SLOT` 可能缺失。查询保留 `source_rack/target_rack=null`，不能把缺少货架记录解释成伸展要求为0；可用与 `scene_sha256` 匹配的布局缓存补充，否则能力结论为未知。本次不修改导入逻辑。\n\n    例如：A1 不能承接“尚未取下的 L3 出库货物”；已由长臂取下且确认交接后，若剩余目标是地面出库口，A1 可通过剩余机械臂要求检查。L3 入库任务的目标仍在高层，接力不会消除这个要求。\n    "
+    },
+    {
+      "id": "task_evidence",
+      "title": "任务执行与交接证据",
+      "business_question": "任务有没有被执行、重新排队或交接？目前有哪些归属和载货证据？",
+      "trigger": "接单前查少量候选；取货/放货/交接前查相关任务；恢复时查本机未完成任务。",
+      "sample_parameters": {
+        "run_id": "YOUR_RUN_ID",
+        "dataset_id": "ANCHOR_DATASET_ID",
+        "t": 100,
+        "task_ids": [
+          "KNOWN_TASK_ID"
+        ],
+        "evidence_fetch_limit": 17
+      },
+      "cypher": "MATCH (:Run {id: $run_id})-[:USES_DATASET]->(dataset:Dataset {id: $dataset_id})\nUNWIND $task_ids AS requested_task_id\nOPTIONAL MATCH (dataset)-[:INCLUDES_TASK]->(task:WarehouseTask {task_id: requested_task_id})\nCALL {\n  WITH task\n  OPTIONAL MATCH (state:ExecutionState {run_id: $run_id, task_id: task.task_id})\n  WHERE state.tick <= $t\n  WITH state ORDER BY state.tick DESC, state.id DESC LIMIT 1\n  RETURN properties(state) AS execution_sample\n}\nCALL {\n  WITH task\n  OPTIONAL MATCH (change:OwnershipChange {run_id: $run_id, task_id: task.task_id})\n  WHERE change.tick <= $t\n  WITH change ORDER BY change.tick DESC, change.id DESC LIMIT $evidence_fetch_limit\n  RETURN collect(properties(change)) AS ownership_changes\n}\nCALL {\n  WITH task\n  OPTIONAL MATCH (handoff:Handoff {run_id: $run_id, task_id: task.task_id})\n  WHERE handoff.tick <= $t\n  WITH handoff ORDER BY handoff.tick DESC, handoff.id DESC LIMIT $evidence_fetch_limit\n  RETURN collect(properties(handoff)) AS handoffs\n}\nCALL {\n  WITH task\n  OPTIONAL MATCH (event:RuntimeEvent {run_id: $run_id, task_id: task.task_id})\n  WHERE event.tick <= $t AND event.type <> 'boundary_port_bound'\n  WITH event ORDER BY event.tick DESC, event.id DESC LIMIT $evidence_fetch_limit\n  RETURN collect(properties(event)) AS operation_events\n}\nRETURN requested_task_id, task IS NOT NULL AS task_exists,\n       execution_sample, ownership_changes, handoffs, operation_events",
+      "interpretation": "\n    **存在理由：**“任务定义存在”“调度快照里出现”不能回答谁正在做；接力也不能只看一条 `ASSIGNED_TO` 关系就认定货物归属。\n\n    同时返回任务状态样本、责任变更、真实交接和操作事件。组装器识别分配、取货、完成、`task_requeued` 等证据；若较新的重新排队推翻旧分配，不得沿用旧负责人。`Handoff` 表示已发生交接，不等于某个帮助请求已被接收。\n\n    不读取可变 `Execution.current_robot_id/status` 回答过去，也不将多条 `ASSIGNED_TO` 当成同时多个负责人。`ExecutionState.status` 可能是动作阶段，不能仅按“不是 completed”推导可领取。\n\n    每组最多显示16条，用第17条标记截断；`execution_sample` 返回样本 tick，不能默认等于 t。同 tick 多个互相矛盾的变更不能靠字符串 ID 排序认定先后；若无可靠业务序号则输出 `conflict/unknown`。没有证据不等于“任务无人认领”，近期证据也不代替动作前的原子认领及当前货物持有验证。\n    "
+    },
+    {
+      "id": "peer_states",
+      "title": "同伴状态与接力候选依据",
+      "business_question": "哪些同伴值得进一步联系或避让？谁可能接走已取下的货？",
+      "trigger": "发生求助、准备接力，或需要周边态势时；同一 t 的同伴读取可在机器人之间共享。",
+      "sample_parameters": {
+        "run_id": "YOUR_RUN_ID",
+        "robot_id": 1,
+        "t": 100,
+        "max_peer_age_ticks": 4
+      },
+      "cypher": "MATCH (:Run {id: $run_id})\nMATCH (robot:Robot {run_id: $run_id})\nWHERE robot.robot_id <> $robot_id\nCALL {\n  WITH robot\n  OPTIONAL MATCH (state:AgentState {run_id: $run_id, robot_node_id: robot.id})\n  WHERE state.tick <= $t\n  WITH state ORDER BY state.tick DESC, state.id DESC LIMIT 1\n  RETURN state{.tick, .stage, .battery, .x, .y, .task_id, .cargo_id} AS state\n}\nRETURN robot.robot_id AS robot_id, robot.type AS robot_type, state,\n       $t - state.tick AS age_ticks,\n       CASE WHEN state IS NOT NULL AND $t - state.tick <= $max_peer_age_ticks\n            THEN true ELSE false END AS state_fresh\nORDER BY robot_id",
+      "interpretation": "\n    **存在理由：**请求帮助必须知道可能的接收者；同一批位置和状态也能支持附近态势，没必要另造一条只改排序的“附近机器人查询”。\n\n    不在 Cypher 中先删掉缺状态的同伴，否则无法知道候选是否因采样缺失而消失。返回数量应与 `basis.step.expected_robot_count - 1` 对照；不足时记录机队观测缺项。\n\n    组装器先筛新鲜、字段完整、`stage=idle`、无已观察任务/货物、且不在 `task_pool.active_jobs` 的同伴，电量阈值取运行配置的 `charge_request_soc`，再用 `task_geometry` 检查剩余目标能力。按直线距离只做初筛排序，并明确标记 `distance_kind=euclidean_sort_only`。\n\n    这些是“潜在接收者”，不是已承诺助手。`AgentState` 没有完整故障、`carrying` 和助手预约字段；`cargo_id=null` 本身不能证明物理空载。最终必须由执行器确认无故障、空载、无其他工作和协助占用，并通过会合路线、交接点、投递及后续补能的时间/能源检查。也不能用点位快照代替 SIPP 的时空避碰。\n    "
+    },
+    {
+      "id": "self_feedback",
+      "title": "本机近期执行反馈",
+      "business_question": "刚才的操作有什么结果？我在等待、耗电还是持续没有进展？",
+      "trigger": "执行反馈到达、长时间未观察到进展、低电、补能或恢复判断时；无需每次接单都读取。",
+      "sample_parameters": {
+        "run_id": "YOUR_RUN_ID",
+        "robot_id": 1,
+        "t": 100,
+        "from_tick": 40,
+        "state_fetch_limit": 65,
+        "event_fetch_limit": 33
+      },
+      "cypher": "MATCH (:Run {id: $run_id})\nMATCH (robot:Robot {id: $run_id + ':robot:' + toString($robot_id), run_id: $run_id})\nCALL {\n  WITH robot\n  MATCH (state:AgentState {run_id: $run_id, robot_node_id: robot.id})\n  WHERE $from_tick < state.tick AND state.tick <= $t\n  WITH state ORDER BY state.tick DESC, state.id DESC LIMIT $state_fetch_limit\n  RETURN collect(state{.tick, .stage, .battery, .x, .y, .task_id, .cargo_id}) AS states\n}\nCALL {\n  WITH robot\n  MATCH (event:RuntimeEvent {run_id: $run_id, robot_node_id: robot.id})\n  WHERE $from_tick < event.tick AND event.tick <= $t\n  WITH event ORDER BY event.tick DESC, event.id DESC LIMIT $event_fetch_limit\n  RETURN collect(properties(event)) AS events\n}\nRETURN robot.robot_id AS robot_id, $from_tick AS from_tick, $t AS through_tick,\n       states, events, 'robot_node_id' AS event_scope",
+      "interpretation": "\n    **存在理由：**只看当前状态无法知道动作是否有进展，也无法区别正常排队、补能和需要重新规划的情况。\n\n    返回窗口 `(from_tick, t]` 内的真实状态样本和本机事件，组装器按时间升序比较位置、电量与阶段，输出 `observed_movement / observed_soc_delta / recent_operation_events / sample_gap_ticks`，不把一条空事件列表解释成“没有异常”。\n\n    示例最多显示64条状态、32条事件，分别取65/33识别截断；两组独立标记，不将截断窗口的首尾差称为完整窗口统计。状态数量不是持续时长；tick 与秒的映射没有确认时，不输出每秒耗电率。\n\n    只观察到位置不变，不能直接认定故障：正常取放、排队、充电和换电也可能静止。这里只读取写者明确关联 `robot_node_id` 的事件；不关联本机的全局事件不在此范围，相关任务交接等通过 `task_evidence` 补充。没有补能事件也不证明没有补能。\n    "
+    }
+  ]
+}

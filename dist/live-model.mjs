@@ -68,6 +68,21 @@ export function controlPayload(action,frame,extra={}){
   if(!frame||typeof frame.runId!=='string'||!frame.runId)throw new Error('控制操作需要当前真实run身份');
   return {...extra,action,expected_run_id:frame.runId};
 }
+export function newRunOptions(datasetId,runId='',maxTicks=''){
+  if(typeof datasetId!=='string'||!datasetId)throw new Error('请选择服务端已验证的数据集');
+  if(typeof runId!=='string')throw new Error('runId 必须是文本');
+  const name=runId.trim();
+  if(name&&!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(name))throw new Error('runId 须为1～128位，以英文字母或数字开头，仅可包含字母、数字、下划线、短横线和点');
+  const raw=typeof maxTicks==='string'?maxTicks.trim():maxTicks;
+  let limit=null;
+  if(raw!==''&&raw!==null){
+    if(typeof raw==='boolean'||!['string','number'].includes(typeof raw)
+      ||typeof raw==='string'&&!/^[0-9]+$/.test(raw))throw new Error('最大 tick 须为正整数，留空不限制');
+    limit=Number(raw);
+    if(!Number.isInteger(limit)||limit<1||limit>2147483647)throw new Error('最大 tick 须为 1～2147483647 的整数，留空不限制');
+  }
+  return {dataset_id:datasetId,...(name?{run_id:name}:{}),...(limit===null?{}:{max_ticks:limit})};
+}
 export function normalizeDatasets(value){
   const rows=Array.isArray(value)?value:value?.datasets;
   if(!Array.isArray(rows))throw new Error('固定数据集目录格式无效');
@@ -131,8 +146,9 @@ export function filteredRobots(frame,filter='all',search=''){
 }
 export function controlAvailability(frame,busy=false){
   const ready=Boolean(frame)&&!busy,phase=frame?.status||(frame?.running?'running':'paused');
-  return {start:ready&&['ready','paused'].includes(phase),pause:ready&&phase==='running',
-    step:ready&&['ready','paused'].includes(phase),speed:ready&&phase!=='failed',new_run:ready};
+  const capped=frame?.tickLimitReached===true||(Number.isInteger(frame?.maxTicks)&&frame.tick>=frame.maxTicks);
+  return {start:ready&&!capped&&['ready','paused'].includes(phase),pause:ready&&phase==='running',
+    step:ready&&!capped&&['ready','paused'].includes(phase),speed:ready&&phase!=='failed',new_run:ready};
 }
 export function exportRows(frame){
   const fields=['robot_id','stage','x','y','battery','carrying','task_id','cargo_id','dock_id',

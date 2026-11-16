@@ -55,6 +55,19 @@ def snapshot():
 
 
 class RuntimeGraphWriterTests(unittest.TestCase):
+    def test_disabling_agent_history_keeps_current_state_and_business_events(self):
+        driver=FakeDriver()
+        writer=Neo4jRuntimeGraphWriter(uri='bolt://test',user='neo4j',password=None,
+                                      driver=driver,record_agent_state=False)
+        sample=snapshot()
+        writer.record_robot_snapshot(sample)
+        writer.record_robot_current_state(sample,{'robot_id':1,'battery':88.0})
+        queries=[query for query,_ in driver.session_instance.calls]
+        self.assertNotIn(_WRITE_AGENT_STATES,queries)
+        self.assertIn(_WRITE_EVENTS,queries)
+        current=[params for _,params in driver.session_instance.calls if any('payload' in r for r in params.get('robots',[]))]
+        self.assertTrue(current)
+
     def test_actor_current_state_registers_robot_once_per_run(self):
         from backend.warehouse_runtime_graph import _WRITE_ROBOTS_ONLY, _UPDATE_ROBOTS_ONLY
         driver = FakeDriver()
